@@ -1,0 +1,13 @@
+# Dataset
+data/
+*.bin
+
+# Model Outputs & Checkpoints
+outputs/
+outputs_9feat/
+checkpoints/
+checkpoints_9feat/
+
+# Python
+__pycache__/
+*.pyc

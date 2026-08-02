@@ -1,0 +1,20 @@
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ArduPilot log parsing
+pymavlink>=2.4.40
+
+# Numerical & data
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0
+
+# Config management
+pyyaml>=6.0.1
+
+# Visualization & export
+matplotlib>=3.8.0
+
+# Utilities
+tqdm>=4.66.0

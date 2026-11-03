@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader, random_split
 
 import yaml
 
-from src.data_parser import parse_directory, TrajectoryDataset
+from src.data_parser import parse_directory_from_config, TrajectoryDataset
 from src.diffusion_math import CosineNoiseScheduler
 from src.unet_1d import UNet1D
 
@@ -95,10 +95,7 @@ def train(config: dict):
 
     # ── Data ─────────────────────────────────────────────────────────────────
     logger.info(f"Loading trajectories from: {config['data']['data_dir']}")
-    trajectories, mean_dt_s, mean_speed_ms = parse_directory(
-        config["data"]["data_dir"],
-        min_mission_samples=config["data"]["min_mission_samples"],
-    )
+    trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
 
     dataset = TrajectoryDataset(
         trajectories,

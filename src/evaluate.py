@@ -64,7 +64,7 @@ import pandas as pd
 import torch
 import yaml
 
-from src.data_parser import parse_directory, TrajectoryDataset
+from src.data_parser import parse_directory_from_config, TrajectoryDataset
 from src.diffusion_math import KinematicGuidance
 
 logger = logging.getLogger(__name__)
@@ -407,10 +407,7 @@ def evaluate(config: dict, generated_csv: str):
 
     # ── Load real trajectories ────────────────────────────────────────────────
     logger.info("Loading real trajectories for evaluation …")
-    trajectories, mean_dt_s, mean_speed_ms = parse_directory(
-        config["data"]["data_dir"],
-        min_mission_samples=config["data"]["min_mission_samples"],
-    )
+    trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
     dataset = TrajectoryDataset(
         trajectories,
         sequence_length=config["data"]["sequence_length"],

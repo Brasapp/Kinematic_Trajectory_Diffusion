@@ -8,7 +8,14 @@ data:
   checkpoint_dir: "checkpoints_3feat/"   # Model weight snapshots saved here
   sequence_length: 256             # Fixed window length (samples) for each trajectory segment
   features: 3                      # [roll, pitch, alt]
-  min_mission_samples: 250         # Minimum AUTO-mode samples for a segment to be kept
+  feature_names: [roll, pitch, alt]  # Model channels, picked from data_parser.FULL_COLUMNS
+  resample_hz: 10.0                # Uniform grid rate; dt = 1 / resample_hz
+  modes: [AUTO, STABILIZE, MANUAL, RTL, CIRCLE, FBWA, FBWB, CRUISE, LOITER]  # flight modes to keep (AUTO alone gives only ~11 min)
+  min_speed_ms: 10.0               # Drop samples slower than this (on the ground / taxiing)
+  max_gap_s: 0.3                   # Drop stretches where the log is sparser than this
+  gps_timeout_s: 1.0               # Drop samples without a GPS 3D fix in the last N seconds
+  max_pos_jump_m: 3.0              # Drop EKF resets (position step vs velocity mismatch)
+  min_mission_samples: 256         # Minimum resampled samples per segment (>= sequence_length)
   stride: 128                      # Sliding window stride (overlap = sequence_length - stride)
 
 diffusion:

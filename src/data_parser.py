@@ -6,471 +6,484 @@ PyTorch trajectory tensors for diffusion model training.
 
 Pipeline
 --------
-1.  Open a ``.bin`` file with ``pymavlink.DFReader.DFReader_binary``.
-2.  Extract ``MODE`` messages to locate **AUTO-mode** flight segments.
-    Only segments with at least ``min_mission_samples`` data points are kept.
-3.  Within each AUTO segment extract:
-    - ``GPS`` (or ``POS``) messages → Lat, Lon, Alt
-    - ``AHR2`` messages           → Yaw (heading, degrees)
-    - ``NKF1`` messages           → VN, VE, VD (velocity m/s, EKF estimate)
-      Fallback: numerical differentiation of NED position if NKF1 is absent.
-4.  Convert Lat/Lon/Alt to local NED (North-East-Down) metres using the
-    equirectangular projection anchored at the first valid GPS fix.
-5.  Align all message streams to a common timestamp grid via linear
-    interpolation.
-6.  Produce a feature tensor of shape ``[T, 3]`` with columns
-    ``[roll_rad, pitch_rad, alt_m]``.
-7.  ``TrajectoryDataset`` wraps all parsed tensors, applies Z-score
-    normalisation, and yields fixed-length sliding windows suitable for
-    the diffusion model.
+1.  Read each ``.bin`` log once with ``pymavlink``.
+2.  Take the state from a single, self-consistent source:
 
-Coordinate Conversion
----------------------
-Equirectangular approximation for converting WGS-84 lat/lon/alt to local NED:
+    - ``XKF1`` (EKF3, core 0)  → PN/PE/PD position, VN/VE/VD velocity,
+      roll/pitch/yaw.  Used by ArduPilot 4.x.
+    - ``NKF1`` (EKF2, core 0)  → same fields, for older firmware.
+    - Fallback when neither exists: ``GPS`` (the receiver with the most 3D
+      fixes, 3D fixes only) for
+      position/velocity and ``ATT`` (or ``AHR2``) for attitude.
 
-.. math::
+    Position streams are never mixed (the old parser interleaved GPS and POS,
+    which created a sawtooth in altitude and an absurd mean speed).
+3.  Resample everything onto a uniform time grid (``resample_hz``).
+    Angles are interpolated through sin/cos so ±180° wraps (inverted flight,
+    north crossings) stay correct.
+4.  Keep only samples that are in one of the selected flight modes, flying
+    (horizontal speed ≥ ``min_speed_ms``) and densely logged (source sample
+    spacing ≤ ``max_gap_s``).  Contiguous runs become
+    segments; runs shorter than ``min_mission_samples`` are dropped.
+5.  ``TrajectoryDataset`` z-score normalises and cuts sliding windows.
 
-    N = R \\cdot (\\phi - \\phi_0), \\qquad
-    E = R \\cdot \\cos(\\phi_0) \\cdot (\\lambda - \\lambda_0), \\qquad
-    D = -(h - h_0)
+Every segment carries all columns in ``FULL_COLUMNS``; callers choose the
+model features with ``feature_names`` (default ``roll, pitch, alt``).
 
-where :math:`R = 6{,}371{,}000` m is Earth's mean radius,
-:math:`(\\phi_0, \\lambda_0, h_0)` is the reference origin (first GPS fix),
-and :math:`h` is altitude (m).
-
-AUTO Mode Detection
--------------------
-ArduPilot ``MODE`` log messages carry a numeric mode field.
-The AUTO mode numbers are:
-- ArduCopter : ``3``
-- ArduPlane  : ``10``
-Both are detected automatically.
+Run ``python -m src.data_parser --data_dir data/`` to print per-log
+diagnostics (speed, bank angle, altitude, segment lengths).
 """
 
-import os
-import math
+import argparse
+import hashlib
 import logging
+import math
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from scipy.interpolate import interp1d
 
 try:
     from pymavlink.DFReader import DFReader_binary
 except ImportError as exc:
-    raise ImportError(
-        "pymavlink is required: pip install pymavlink"
-    ) from exc
+    raise ImportError("pymavlink is required: pip install pymavlink") from exc
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-EARTH_RADIUS_M        = 6_371_000.0    # mean Earth radius in metres
-AUTO_MODE_COPTER      = 3              # ArduCopter AUTO mode number
-AUTO_MODE_PLANE       = 10             # ArduPlane  AUTO mode number
-AUTO_MODE_NAMES       = {"auto"}       # lower-case mode name fallback
+EARTH_RADIUS_M = 6_371_000.0
+
+# ArduPlane mode numbers (ModeNum in the MODE message)
+PLANE_MODES = {
+    "MANUAL": 0, "CIRCLE": 1, "STABILIZE": 2, "TRAINING": 3, "ACRO": 4,
+    "FBWA": 5, "FBWB": 6, "CRUISE": 7, "AUTOTUNE": 8, "AUTO": 10, "RTL": 11,
+    "LOITER": 12, "TAKEOFF": 13, "AVOID_ADSB": 14, "GUIDED": 15,
+    "QSTABILIZE": 17, "QHOVER": 18, "QLOITER": 19, "QLAND": 20, "QRTL": 21,
+    "QAUTOTUNE": 22, "QACRO": 23, "THERMAL": 24, "LOITER_ALT_QLAND": 25,
+}
+COPTER_MODES = {
+    "STABILIZE": 0, "ACRO": 1, "ALT_HOLD": 2, "AUTO": 3, "GUIDED": 4,
+    "LOITER": 5, "RTL": 6, "CIRCLE": 7, "LAND": 9, "POSHOLD": 16,
+}
+
+# Columns of every parsed segment, in order.
+FULL_COLUMNS = [
+    "N", "E", "alt",        # m, local frame; alt is positive up, relative to EKF origin / first fix
+    "vN", "vE", "vD",       # m/s
+    "roll", "pitch", "yaw", # rad; roll and yaw wrapped to (-pi, pi]
+    "airspeed",             # m/s (CTUN.As, NaN if not logged)
+]
+COL = {name: i for i, name in enumerate(FULL_COLUMNS)}
+DEFAULT_FEATURES = ("roll", "pitch", "alt")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1.  COORDINATE CONVERSION
+# 1.  SMALL HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def latlon_to_ned(
-    lat: np.ndarray,
-    lon: np.ndarray,
-    alt: np.ndarray,
-    lat0: float,
-    lon0: float,
-    alt0: float,
-) -> np.ndarray:
-    r"""Convert WGS-84 geodetic coordinates to local NED (metres).
-
-    Uses the equirectangular (flat-Earth) approximation — valid for
-    flight areas smaller than ~50 km across.
+def latlon_to_ned(lat, lon, alt, lat0, lon0, alt0) -> np.ndarray:
+    r"""Equirectangular WGS-84 → local NED (metres). Valid for areas < ~50 km.
 
     .. math::
-
-        N = R \cdot (\phi - \phi_0), \qquad
-        E = R \cdot \cos(\phi_0) \cdot (\lambda - \lambda_0), \qquad
-        D = -(h - h_0)
-
-    Parameters
-    ----------
-    lat, lon, alt : ndarray[T] — geodetic coordinates (degrees, degrees, metres)
-    lat0, lon0, alt0 : float  — reference origin (first valid GPS fix)
-
-    Returns
-    -------
-    ned : ndarray[T, 3] — local NED coordinates in metres
+        N = R(\phi-\phi_0),\quad E = R\cos\phi_0(\lambda-\lambda_0),\quad D = -(h-h_0)
     """
-    phi   = np.deg2rad(lat)
-    phi0  = math.radians(lat0)
-    lam   = np.deg2rad(lon)
-    lam0  = math.radians(lon0)
-
-    N =  EARTH_RADIUS_M * (phi - phi0)
-    E =  EARTH_RADIUS_M * math.cos(phi0) * (lam - lam0)
-    D = -(alt - alt0)
-
-    return np.stack([N, E, D], axis=-1)   # [T, 3]
+    phi, phi0 = np.deg2rad(lat), math.radians(lat0)
+    lam, lam0 = np.deg2rad(lon), math.radians(lon0)
+    N = EARTH_RADIUS_M * (phi - phi0)
+    E = EARTH_RADIUS_M * math.cos(phi0) * (lam - lam0)
+    D = -(np.asarray(alt) - alt0)
+    return np.stack([N, E, D], axis=-1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2.  AUTO-MODE SEGMENT DETECTION
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _is_auto_mode(mode_val) -> bool:
-    """Return True if the raw mode value corresponds to ArduPilot AUTO mode."""
-    if isinstance(mode_val, (int, float)):
-        return int(mode_val) in (AUTO_MODE_COPTER, AUTO_MODE_PLANE)
-    if isinstance(mode_val, str):
-        return mode_val.strip().lower() in AUTO_MODE_NAMES
-    return False
+def wrap_pi(a: np.ndarray) -> np.ndarray:
+    """Wrap angles to (-pi, pi]."""
+    return np.arctan2(np.sin(a), np.cos(a))
 
 
-def _extract_auto_intervals(
-    log: DFReader_binary,
-) -> List[Tuple[float, float]]:
-    """Parse MODE messages and return (start_us, end_us) tuples for each
-    AUTO-mode interval.
-
-    Parameters
-    ----------
-    log : DFReader_binary — rewound to the beginning
-
-    Returns
-    -------
-    intervals : list of (start_us, end_us) in microseconds
-    """
-    log.rewind()
-    mode_events: List[Tuple[float, bool]] = []
-
-    while True:
-        msg = log.recv_match(type="MODE", blocking=False)
-        if msg is None:
-            break
-        timestamp_us = getattr(msg, "TimeUS", None) or getattr(msg, "_timestamp", 0) * 1e6
-        mode_val = getattr(msg, "Mode", None)
-        if mode_val is None:
-            continue
-        mode_events.append((float(timestamp_us), _is_auto_mode(mode_val)))
-
-    if not mode_events:
-        logger.warning("No MODE messages found — treating entire log as AUTO.")
-        return [(0.0, float("inf"))]
-
-    intervals: List[Tuple[float, float]] = []
-    in_auto  = False
-    start_us = 0.0
-
-    for ts, is_auto in mode_events:
-        if is_auto and not in_auto:
-            start_us = ts
-            in_auto  = True
-        elif not is_auto and in_auto:
-            intervals.append((start_us, ts))
-            in_auto = False
-
-    # If still in AUTO at end of log
-    if in_auto:
-        intervals.append((start_us, float("inf")))
-
-    logger.info(f"Found {len(intervals)} AUTO-mode interval(s).")
-    return intervals
+def _sorted_unique(t: np.ndarray, *cols: np.ndarray):
+    """Sort by time and drop duplicate timestamps."""
+    if len(t) == 0:
+        return (t, *cols)
+    order = np.argsort(t, kind="stable")
+    t = t[order]
+    keep = np.concatenate([[True], np.diff(t) > 0])
+    return (t[keep], *(c[order][keep] for c in cols))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3.  RAW DATA EXTRACTION
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _extract_streams(log: DFReader_binary) -> dict:
-    """Extract all relevant message streams from the log into numpy arrays.
-
-    Streams extracted
-    -----------------
-    gps  : TimeUS, Lat, Lng, Alt
-    ahr2 : TimeUS, Yaw  (degrees)
-    nkf1 : TimeUS, VN, VE, VD  (velocity, m/s)  — may be empty
-    mode : TimeUS, Mode (int)
-
-    Returns
-    -------
-    dict with keys 'gps', 'ahr2', 'nkf1', each a dict of arrays keyed by field name.
-    """
-    streams = {
-        "gps":  {"t": [], "lat": [], "lng": [], "alt": []},
-        "ahr2": {"t": [], "yaw": [], "roll": [], "pitch": []},
-        "nkf1": {"t": [], "vn": [], "ve": [], "vd": []},
-    }
-    accepted_gps = ("GPS", "POS")
-
-    log.rewind()
-
-    while True:
-        msg = log.recv_match(type={"GPS", "POS", "AHR2", "NKF1"}, blocking=False)
-        if msg is None:
-            break
-
-        mtype = msg.get_type()
-        ts = float(getattr(msg, "TimeUS", 0))
-
-        if mtype in accepted_gps:
-            lat = getattr(msg, "Lat", None)
-            lng = getattr(msg, "Lng", getattr(msg, "Lon", None))
-            alt = getattr(msg, "Alt", None)
-            if lat is not None and lng is not None and alt is not None:
-                streams["gps"]["t"].append(ts)
-                streams["gps"]["lat"].append(lat)
-                streams["gps"]["lng"].append(lng)
-                streams["gps"]["alt"].append(alt)
-
-        elif mtype == "AHR2":
-            yaw   = getattr(msg, "Yaw",   None)
-            roll  = getattr(msg, "Roll",  None)
-            pitch = getattr(msg, "Pitch", None)
-            if yaw is not None:
-                streams["ahr2"]["t"].append(ts)
-                streams["ahr2"]["yaw"].append(yaw)
-                streams["ahr2"]["roll"].append(roll if roll is not None else 0.0)
-                streams["ahr2"]["pitch"].append(pitch if pitch is not None else 0.0)
-
-        elif mtype == "NKF1":
-            vn = getattr(msg, "VN", None)
-            ve = getattr(msg, "VE", None)
-            vd = getattr(msg, "VD", None)
-            if vn is not None:
-                streams["nkf1"]["t"].append(ts)
-                streams["nkf1"]["vn"].append(vn)
-                streams["nkf1"]["ve"].append(ve)
-                streams["nkf1"]["vd"].append(vd)
-
-    # Convert to numpy
-    for key in streams:
-        for field in streams[key]:
-            streams[key][field] = np.array(streams[key][field], dtype=np.float64)
-
-    return streams
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 4.  TRAJECTORY ASSEMBLY
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _interp(t_src: np.ndarray, y_src: np.ndarray,
-            t_dst: np.ndarray) -> np.ndarray:
-    """Linear interpolation with extrapolation clamped to boundary values."""
+def _interp(t_src, y_src, t_dst) -> np.ndarray:
+    """Linear interpolation; NaN outside the source range."""
     if len(t_src) < 2:
-        return np.full(len(t_dst), y_src[0] if len(y_src) else np.nan)
-    f = interp1d(t_src, y_src, kind="linear", bounds_error=False,
-                 fill_value=(y_src[0], y_src[-1]))
-    return f(t_dst)
+        return np.full(len(t_dst), np.nan)
+    return np.interp(t_dst, t_src, y_src, left=np.nan, right=np.nan)
 
 
-def _build_trajectory(
-    streams: dict,
-    start_us: float,
-    end_us: float,
-) -> Optional[tuple]:
-    """Build a [T, 3] trajectory array for a single AUTO-mode interval.
+def _interp_angle(t_src, a_src, t_dst) -> np.ndarray:
+    """Interpolate an angle (rad) through sin/cos so wraps are handled."""
+    s = _interp(t_src, np.sin(a_src), t_dst)
+    c = _interp(t_src, np.cos(a_src), t_dst)
+    return np.arctan2(s, c)
 
-    Feature columns: [roll_rad, pitch_rad, alt_m]
 
-    Also estimates the mean GPS sample interval dt_s (seconds/step) and the mean
-    velocity (m/s) during the interval.
+def _file_md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    Parameters
-    ----------
-    streams  : raw message streams from _extract_streams
-    start_us : interval start in microseconds
-    end_us   : interval end in microseconds
 
-    Returns
-    -------
-    (traj, dt_s, speed_mean) : (ndarray[T, 3], float, float) or None if too few points
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  RAW EXTRACTION (single pass)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_EKF_FIELDS = ("PN", "PE", "PD", "VN", "VE", "VD", "Roll", "Pitch", "Yaw")
+
+
+def _read_log(path: Path) -> dict:
+    """Read every message type we need in one pass. Returns raw numpy arrays."""
+    log = DFReader_binary(str(path), zero_time_base=True)
+
+    ekf = {"XKF1": {k: [] for k in ("t",) + _EKF_FIELDS},
+           "NKF1": {k: [] for k in ("t",) + _EKF_FIELDS}}
+    gps = {k: [] for k in ("t", "inst", "lat", "lng", "alt", "spd", "crs", "vz")}
+    att = {k: [] for k in ("t", "roll", "pitch", "yaw")}
+    ahr2 = {k: [] for k in ("t", "roll", "pitch", "yaw")}
+    ctun = {"t": [], "as": []}
+    modes: List[Tuple[float, int]] = []
+    firmware = None
+
+    want = {"XKF1", "NKF1", "GPS", "ATT", "AHR2", "CTUN", "MODE", "MSG"}
+    while True:
+        m = log.recv_match(type=want, blocking=False)
+        if m is None:
+            break
+        typ = m.get_type()
+        t = float(getattr(m, "TimeUS", 0))
+
+        if typ in ekf:
+            if int(getattr(m, "C", 0)) != 0:        # core 0 only
+                continue
+            d = ekf[typ]
+            d["t"].append(t)
+            for k in _EKF_FIELDS:
+                d[k].append(float(getattr(m, k, np.nan)))
+        elif typ == "GPS":
+            if int(getattr(m, "Status", 3)) < 3:
+                continue                             # need a 3D fix
+            gps["t"].append(t)
+            gps["inst"].append(int(getattr(m, "I", getattr(m, "Instance", 0))))
+            gps["lat"].append(m.Lat); gps["lng"].append(m.Lng); gps["alt"].append(m.Alt)
+            gps["spd"].append(getattr(m, "Spd", np.nan))
+            gps["crs"].append(getattr(m, "GCrs", np.nan))
+            gps["vz"].append(getattr(m, "VZ", np.nan))
+        elif typ in ("ATT", "AHR2"):
+            d = att if typ == "ATT" else ahr2
+            d["t"].append(t); d["roll"].append(m.Roll)
+            d["pitch"].append(m.Pitch); d["yaw"].append(m.Yaw)
+        elif typ == "CTUN":
+            ctun["t"].append(t); ctun["as"].append(float(getattr(m, "As", np.nan)))
+        elif typ == "MODE":
+            num = getattr(m, "ModeNum", getattr(m, "Mode", None))
+            if isinstance(num, (int, float)):
+                modes.append((t, int(num)))
+        elif typ == "MSG" and firmware is None:
+            text = str(getattr(m, "Message", ""))
+            if text.startswith("Ardu"):
+                firmware = text
+
+    def arr(d):
+        return {k: np.asarray(v, dtype=np.float64) for k, v in d.items()}
+
+    # Keep one receiver only: the one with the most 3D fixes (the GPS is not
+    # always wired to the first port).
+    g = arr(gps)
+    if len(g["t"]):
+        insts, counts = np.unique(g["inst"], return_counts=True)
+        sel = g["inst"] == insts[np.argmax(counts)]
+        g = {k: v[sel] for k, v in g.items()}
+
+    return {
+        "XKF1": arr(ekf["XKF1"]), "NKF1": arr(ekf["NKF1"]),
+        "GPS": g, "ATT": arr(att), "AHR2": arr(ahr2), "CTUN": arr(ctun),
+        "modes": sorted(modes), "firmware": firmware,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3.  STATE ON A UNIFORM GRID
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _state_on_grid(raw: dict, resample_hz: float):
+    """Build the full state [T, len(FULL_COLUMNS)] on a uniform time grid.
+
+    Returns (t_grid_us, state, source_name, gap_s) where ``gap_s`` is the
+    spacing of the real source samples around each grid point.
     """
-    gps = streams["gps"]
-    t_gps = gps["t"]
+    step_us = 1e6 / resample_hz
+    ekf_name = "XKF1" if len(raw["XKF1"]["t"]) > 10 else ("NKF1" if len(raw["NKF1"]["t"]) > 10 else None)
 
-    # Mask GPS to this AUTO interval
-    mask = (t_gps >= start_us) & (t_gps <= end_us)
-    if mask.sum() < 2:
-        return None
-
-    t_ref = t_gps[mask]
-    lat   = gps["lat"][mask]
-    lng   = gps["lng"][mask]
-    alt   = gps["alt"][mask]
-
-    # Mean timestep in seconds (from actual log timestamps)
-    dt_s = float(np.mean(np.diff(t_ref)) / 1e6) if len(t_ref) > 1 else 0.1
-    dt_s = max(dt_s, 1e-4)  # guard against degenerate logs
-
-    # Reference origin = first GPS fix in this interval
-    lat0, lon0, alt0 = lat[0], lng[0], alt[0]
-
-    # Convert to NED
-    ned = latlon_to_ned(lat, lng, alt, lat0, lon0, alt0)  # [T, 3]
-
-    # Attitude: yaw / roll / pitch (AHR2, interpolated onto GPS timestamps)
-    yaw_deg   = _interp(streams["ahr2"]["t"], streams["ahr2"]["yaw"],   t_ref)
-    roll_deg  = _interp(streams["ahr2"]["t"], streams["ahr2"]["roll"],  t_ref)
-    pitch_deg = _interp(streams["ahr2"]["t"], streams["ahr2"]["pitch"], t_ref)
-
-    yaw_rad   = np.deg2rad(yaw_deg)    # [T]
-    roll_rad  = np.deg2rad(roll_deg)   # [T]
-    pitch_rad = np.deg2rad(pitch_deg)  # [T]
-
-    # ── Calculate mean speed ────────────────────────────────────────────────
-    if len(streams["nkf1"]["t"]) > 1:
-        vn = _interp(streams["nkf1"]["t"], streams["nkf1"]["vn"], t_ref)
-        ve = _interp(streams["nkf1"]["t"], streams["nkf1"]["ve"], t_ref)
-        vd = _interp(streams["nkf1"]["t"], streams["nkf1"]["vd"], t_ref)
-        speed = np.sqrt(vn**2 + ve**2 + vd**2)
+    if ekf_name is not None:
+        e = raw[ekf_name]
+        t, *vals = _sorted_unique(e["t"], *(e[k] for k in _EKF_FIELDS))
+        e = dict(zip(_EKF_FIELDS, vals))
+        grid = np.arange(t[0], t[-1], step_us)
+        N, E = _interp(t, e["PN"], grid), _interp(t, e["PE"], grid)
+        alt = -_interp(t, e["PD"], grid)
+        vN, vE, vD = (_interp(t, e[k], grid) for k in ("VN", "VE", "VD"))
+        roll = _interp_angle(t, np.deg2rad(e["Roll"]), grid)
+        pitch = _interp(t, np.deg2rad(e["Pitch"]), grid)
+        yaw = _interp_angle(t, np.deg2rad(e["Yaw"]), grid)
+        source = ekf_name
     else:
-        # Fallback to horizontal GPS displacement
-        ned = latlon_to_ned(lat, lng, alt, lat[0], lng[0], alt[0])
-        dt = np.diff(t_ref) / 1e6
-        dt = np.where(dt == 0, 1e-6, dt)
-        dn = np.diff(ned[:, 0]) / dt
-        de = np.diff(ned[:, 1]) / dt
-        dd = np.diff(ned[:, 2]) / dt
-        speed = np.sqrt(dn**2 + de**2 + dd**2)
-    
-    speed_mean = float(np.mean(speed)) if len(speed) > 0 else 15.0
+        g = raw["GPS"]
+        if len(g["t"]) < 10:
+            raise ValueError("no EKF (XKF1/NKF1) and too few GPS fixes")
+        t, lat, lng, galt, spd, crs, vz = _sorted_unique(
+            g["t"], g["lat"], g["lng"], g["alt"], g["spd"], g["crs"], g["vz"])
+        grid = np.arange(t[0], t[-1], step_us)
+        ned = latlon_to_ned(lat, lng, galt, lat[0], lng[0], galt[0])
+        N, E = _interp(t, ned[:, 0], grid), _interp(t, ned[:, 1], grid)
+        alt = -_interp(t, ned[:, 2], grid)
+        crs_r = np.deg2rad(crs)
+        vN = _interp(t, spd * np.cos(crs_r), grid)
+        vE = _interp(t, spd * np.sin(crs_r), grid)
+        vD = _interp(t, vz, grid)
+        a = raw["ATT"] if len(raw["ATT"]["t"]) > 10 else raw["AHR2"]
+        at, ar, ap, ay = _sorted_unique(a["t"], a["roll"], a["pitch"], a["yaw"])
+        roll = _interp_angle(at, np.deg2rad(ar), grid)
+        pitch = _interp(at, np.deg2rad(ap), grid)
+        yaw = _interp_angle(at, np.deg2rad(ay), grid)
+        source = "GPS+ATT"
 
-    # Stack into [T, 3]: Attitude + Altitude (positive-UP)
-    traj = np.stack([
-        roll_rad,    # roll  (rad)
-        pitch_rad,   # pitch (rad)
-        alt,         # alt   (m) positive up
-    ], axis=-1).astype(np.float32)
+    c = raw["CTUN"]
+    if len(c["t"]) > 1:
+        ct, cas = _sorted_unique(c["t"], c["as"])
+        airspeed = _interp(ct, cas, grid)
+    else:
+        airspeed = np.full(len(grid), np.nan)
 
-    return traj, dt_s, speed_mean
+    state = np.stack([N, E, alt, vN, vE, vD, roll, pitch, yaw, airspeed], axis=-1)
+
+    # Seconds since the last real source sample at each grid point. Used to drop
+    # stretches where the log was too sparse to resample honestly.
+    src_t = t
+    idx = np.clip(np.searchsorted(src_t, grid, side="right") - 1, 0, len(src_t) - 1)
+    nxt = np.clip(idx + 1, 0, len(src_t) - 1)
+    gap_s = (src_t[nxt] - src_t[idx]) / 1e6
+    return grid, state, source, gap_s
+
+
+def _mode_on_grid(modes: List[Tuple[float, int]], grid: np.ndarray) -> np.ndarray:
+    """Flight-mode number at each grid time (-1 before the first MODE message)."""
+    out = np.full(len(grid), -1, dtype=int)
+    for ts, num in modes:
+        out[grid >= ts] = num
+    return out
+
+
+def _runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """[start, end) index pairs of contiguous True runs."""
+    if not mask.any():
+        return []
+    d = np.diff(np.concatenate([[0], mask.astype(np.int8), [0]]))
+    return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
+
+
+def _resolve_modes(mode_names: Sequence[str], firmware: Optional[str]) -> set:
+    table = COPTER_MODES if firmware and "Copter" in firmware else PLANE_MODES
+    nums = set()
+    for name in mode_names:
+        key = str(name).upper()
+        if key not in table:
+            raise ValueError(f"Unknown flight mode '{name}' for {firmware or 'ArduPlane'}")
+        nums.add(table[key])
+    return nums
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5.  PUBLIC API
+# 4.  PUBLIC API
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_bin_file(
+def parse_bin_file_full(
     path: str,
-    min_mission_samples: int = 100,
-) -> tuple:
-    """Parse an ArduPilot ``.bin`` log and extract AUTO-mode trajectory segments.
-
-    Parameters
-    ----------
-    path : str
-        Path to the ``.bin`` DataFlash log file.
-    min_mission_samples : int
-        Minimum number of GPS samples required for a segment to be returned.
-        Segments shorter than this are silently discarded.
+    min_mission_samples: int = 250,
+    resample_hz: float = 10.0,
+    modes: Sequence[str] = ("AUTO",),
+    min_speed_ms: float = 10.0,
+    max_gap_s: float = 0.3,
+    gps_timeout_s: float = 1.0,
+    max_pos_jump_m: float = 3.0,
+) -> Tuple[List[np.ndarray], dict]:
+    """Parse one log into full-state segments.
 
     Returns
     -------
-    trajectories : list of ndarray[T_i, 3]
-    mean_dt_s    : float — mean GPS sample interval in seconds
-    mean_speed_ms: float — mean flight speed in m/s
-
-    Raises
-    ------
-    FileNotFoundError  : if path does not exist
-    ValueError         : if no valid AUTO segments are found in the log
+    segments : list of ndarray[T_i, len(FULL_COLUMNS)]
+    info     : dict with firmware, source, per-segment start times, etc.
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Log file not found: {path}")
 
-    logger.info(f"Parsing log: {path.name}")
+    raw = _read_log(path)
+    grid, state, source, gap_s = _state_on_grid(raw, resample_hz)
 
-    log = DFReader_binary(str(path), zero_time_base=True)
+    if raw["modes"]:
+        wanted = _resolve_modes(modes, raw["firmware"])
+        in_mode = np.isin(_mode_on_grid(raw["modes"], grid), list(wanted))
+    else:
+        logger.warning(f"{path.name}: no MODE messages — using all flying samples.")
+        in_mode = np.ones(len(grid), dtype=bool)
 
-    # Step 1: find AUTO-mode time intervals
-    intervals = _extract_auto_intervals(log)
+    speed_h = np.hypot(state[:, COL["vN"]], state[:, COL["vE"]])
+    core_ok = np.isfinite(state[:, :COL["airspeed"]]).all(axis=1)
+    dense = gap_s <= max_gap_s
 
-    # Step 2: extract all raw message streams in a single pass
-    streams = _extract_streams(log)
+    # GPS quality: without a recent 3D fix the EKF position is dead-reckoning
+    # and can drift by hundreds of metres.
+    gps_t = np.sort(raw["GPS"]["t"])
+    if len(gps_t) == 0:
+        raise ValueError("no GPS 3D fix in log (EKF position is unaided)")
+    j = np.clip(np.searchsorted(gps_t, grid, side="right") - 1, 0, len(gps_t) - 1)
+    gps_ok = (grid >= gps_t[0]) & ((grid - gps_t[j]) <= gps_timeout_s * 1e6)
 
-    if len(streams["gps"]["t"]) == 0:
-        raise ValueError(f"No GPS/POS messages found in {path.name}")
+    # EKF resets / glitches: position step not explained by velocity.
+    dt = 1.0 / resample_hz
+    pos = np.stack([state[:, COL["N"]], state[:, COL["E"]], -state[:, COL["alt"]]], axis=1)
+    vel = state[:, COL["vN"]:COL["vD"] + 1]
+    step_err = np.linalg.norm(np.diff(pos, axis=0) - 0.5 * (vel[1:] + vel[:-1]) * dt, axis=1)
+    glitch = np.zeros(len(grid), dtype=bool)
+    bad = np.flatnonzero(~(step_err <= max_pos_jump_m))  # also catches NaN
+    glitch[bad] = True
+    glitch[bad + 1] = True
 
-    # Step 3: build a trajectory for each AUTO interval
-    trajectories: List[np.ndarray] = []
-    dt_samples: List[float] = []
-    speed_samples: List[float] = []
-    for i, (start_us, end_us) in enumerate(intervals):
-        result = _build_trajectory(streams, start_us, end_us)
-        if result is None:
-            continue
-        traj, dt_s, speed = result
-        if len(traj) < min_mission_samples:
-            logger.debug(
-                f"Interval {i}: skipped "
-                f"({len(traj)} samples < {min_mission_samples})"
-            )
-            continue
-        trajectories.append(traj)
-        dt_samples.append(dt_s)
-        speed_samples.append(speed)
-        logger.info(f"Interval {i}: kept — {len(traj)} samples.")
+    keep = in_mode & (speed_h >= min_speed_ms) & core_ok & dense & gps_ok & ~glitch
 
-    if not trajectories:
+    segments, starts = [], []
+    for a, b in _runs(keep):
+        if b - a >= min_mission_samples:
+            segments.append(state[a:b].astype(np.float32))
+            starts.append(grid[a] / 1e6)
+
+    info = {
+        "file": path.name, "firmware": raw["firmware"], "source": source,
+        "dt_s": 1.0 / resample_hz, "segment_start_s": starts,
+        "flying_s": float(((speed_h >= min_speed_ms) & core_ok).sum()) / resample_hz,
+        "in_mode_flying_s": float(keep.sum()) / resample_hz,
+        "sparse_flying_s": float(((speed_h >= min_speed_ms) & ~dense).sum()) / resample_hz,
+        "bad_gps_or_ekf_s": float(((speed_h >= min_speed_ms) & (~gps_ok | glitch)).sum()) / resample_hz,
+    }
+    return segments, info
+
+
+def _select(segments: List[np.ndarray], feature_names: Sequence[str]) -> List[np.ndarray]:
+    idx = [COL[f] for f in feature_names]
+    return [np.ascontiguousarray(s[:, idx]) for s in segments]
+
+
+def _mean_speed(segments: List[np.ndarray]) -> float:
+    """Sample-weighted mean 3D ground speed over all segments (m/s)."""
+    if not segments:
+        return float("nan")
+    v = np.concatenate([s[:, COL["vN"]:COL["vD"] + 1] for s in segments])
+    return float(np.linalg.norm(v, axis=1).mean())
+
+
+def parse_bin_file(
+    path: str,
+    min_mission_samples: int = 250,
+    resample_hz: float = 10.0,
+    modes: Sequence[str] = ("AUTO",),
+    min_speed_ms: float = 10.0,
+    feature_names: Sequence[str] = DEFAULT_FEATURES,
+    max_gap_s: float = 0.3,
+) -> tuple:
+    """Parse one log. Returns (trajectories, dt_s, mean_speed_ms)."""
+    segments, info = parse_bin_file_full(path, min_mission_samples, resample_hz, modes, min_speed_ms, max_gap_s)
+    if not segments:
         raise ValueError(
-            f"No AUTO-mode segments with >= {min_mission_samples} samples found in {path.name}. "
-            "Check that the log contains a long enough AUTO mission."
+            f"No {'/'.join(modes)} flying segments with >= {min_mission_samples} samples in {Path(path).name}."
         )
-
-    mean_dt_s = float(np.mean(dt_samples)) if dt_samples else 0.1
-    mean_speed_ms = float(np.mean(speed_samples)) if speed_samples else 15.0
-    return trajectories, mean_dt_s, mean_speed_ms
+    return _select(segments, feature_names), info["dt_s"], _mean_speed(segments)
 
 
 def parse_directory(
     data_dir: str,
-    min_mission_samples: int = 100,
+    min_mission_samples: int = 250,
+    resample_hz: float = 10.0,
+    modes: Sequence[str] = ("AUTO",),
+    min_speed_ms: float = 10.0,
+    feature_names: Sequence[str] = DEFAULT_FEATURES,
+    return_meta: bool = False,
+    max_gap_s: float = 0.3,
+    gps_timeout_s: float = 1.0,
+    max_pos_jump_m: float = 3.0,
 ) -> tuple:
-    """Parse all ``.bin`` files in a directory.
-
-    Parameters
-    ----------
-    data_dir : str
-        Directory containing ``.bin`` files.
-    min_mission_samples : int
-        Forwarded to :func:`parse_bin_file`.
+    """Parse every ``.bin`` in ``data_dir`` (byte-identical duplicates skipped).
 
     Returns
     -------
-    all_trajectories : list of ndarray[T_i, 3]
-    mean_dt_s        : float — mean GPS sample interval in seconds
-    mean_speed_ms    : float — mean flight speed across all logs
+    trajectories  : list of ndarray[T_i, len(feature_names)]
+    dt_s          : float — uniform sample interval (1 / resample_hz)
+    mean_speed_ms : float — sample-weighted mean 3D ground speed
+    meta          : list of dict (only if ``return_meta``) — one per trajectory,
+                    with the source file name, so splits can be done per log.
     """
     data_dir = Path(data_dir)
     bin_files = sorted(data_dir.glob("*.bin"))
     if not bin_files:
         raise FileNotFoundError(f"No .bin files found in {data_dir}")
 
-    all_trajectories: List[np.ndarray] = []
-    all_dts: List[float] = []
-    all_speeds: List[float] = []
+    all_segments: List[np.ndarray] = []
+    meta: List[dict] = []
+    seen: Dict[str, str] = {}
     for f in bin_files:
+        digest = _file_md5(f)
+        if digest in seen:
+            logger.info(f"{f.name}: skipped — identical to {seen[digest]}")
+            continue
+        seen[digest] = f.name
         try:
-            trajs, dt_s, speed_ms = parse_bin_file(str(f), min_mission_samples)
-            all_trajectories.extend(trajs)
-            all_dts.append(dt_s)
-            all_speeds.append(speed_ms)
-            logger.info(f"{f.name}: {len(trajs)} segment(s) extracted.")
+            segs, info = parse_bin_file_full(f, min_mission_samples, resample_hz, modes, min_speed_ms,
+                                              max_gap_s, gps_timeout_s, max_pos_jump_m)
         except ValueError as e:
             logger.warning(f"{f.name}: skipped — {e}")
+            continue
+        if not segs:
+            logger.info(f"{f.name}: no usable segments ({info['in_mode_flying_s']:.0f}s in mode & flying)")
+            continue
+        all_segments.extend(segs)
+        meta.extend({"file": f.name, "segment": i, "start_s": s}
+                    for i, s in enumerate(info["segment_start_s"]))
+        logger.info(f"{f.name}: {len(segs)} segment(s), {sum(map(len, segs))} samples [{info['source']}]")
 
-    if not all_trajectories:
+    if not all_segments:
         raise ValueError(f"No valid trajectories extracted from {data_dir}")
 
-    mean_dt_s = float(np.mean(all_dts)) if all_dts else 0.1
-    mean_speed_ms = float(np.mean(all_speeds)) if all_speeds else 15.0
-    return all_trajectories, mean_dt_s, mean_speed_ms
+    mean_speed = _mean_speed(all_segments)
+    if not 3.0 < mean_speed < 150.0:
+        logger.warning(f"Mean speed {mean_speed:.1f} m/s looks implausible — check the logs.")
+
+    out = (_select(all_segments, feature_names), 1.0 / resample_hz, mean_speed)
+    return out + (meta,) if return_meta else out
+
+
+def parse_directory_from_config(data_cfg: dict, return_meta: bool = False) -> tuple:
+    """``parse_directory`` with arguments taken from the ``data:`` config block."""
+    return parse_directory(
+        data_cfg["data_dir"],
+        min_mission_samples=data_cfg.get("min_mission_samples", 250),
+        resample_hz=data_cfg.get("resample_hz", 10.0),
+        modes=data_cfg.get("modes", ["AUTO"]),
+        min_speed_ms=data_cfg.get("min_speed_ms", 10.0),
+        feature_names=data_cfg.get("feature_names", list(DEFAULT_FEATURES)),
+        return_meta=return_meta,
+        max_gap_s=data_cfg.get("max_gap_s", 0.3),
+        gps_timeout_s=data_cfg.get("gps_timeout_s", 1.0),
+        max_pos_jump_m=data_cfg.get("max_pos_jump_m", 3.0),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -481,7 +494,7 @@ class TrajectoryDataset(Dataset):
     """PyTorch Dataset wrapping parsed UAV trajectory segments.
 
     Applies a sliding window over each trajectory to produce fixed-length
-    samples of shape ``[features, sequence_length]`` (channel-first, as
+    samples of shape ``[F, sequence_length]`` (channel-first, as
     required by ``nn.Conv1d``).
 
     Z-score normalisation is computed across the entire dataset and applied
@@ -490,7 +503,7 @@ class TrajectoryDataset(Dataset):
 
     Parameters
     ----------
-    trajectories : list of ndarray[T_i, 7]
+    trajectories : list of ndarray[T_i, F]
         Raw parsed trajectories (output of :func:`parse_directory`).
     sequence_length : int
         Fixed window length in samples.
@@ -508,7 +521,7 @@ class TrajectoryDataset(Dataset):
         super().__init__()
         self.seq_len    = sequence_length
         self.stride     = stride
-        self.mean_dt_s  = mean_dt_s  # GPS sample interval (s/step), for coordinated-turn constraint
+        self.mean_dt_s  = mean_dt_s  # uniform sample interval (s/step)
 
         # ── Sliding-window segmentation ───────────────────────────────────────
         windows = []
@@ -563,3 +576,63 @@ class TrajectoryDataset(Dataset):
         std  = torch.tensor(self.std,  device=x.device, dtype=x.dtype)
         # Reshape to [..., 7, 1] for broadcasting along L
         return x * std[:, None] + mean[:, None]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7.  DIAGNOSTICS CLI
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _diagnose(data_dir: str, **kw) -> None:
+    """Print per-log statistics so data problems are visible before training."""
+    files = sorted(Path(data_dir).glob("*.bin"))
+    seen: Dict[str, str] = {}
+    all_segs: List[np.ndarray] = []
+    hdr = f"{'file':<28}{'src':>8}{'fly_s':>7}{'use_s':>7}{'sparse':>7}{'badnav':>7}{'segs':>5}{'spd':>7}{'as':>6}{'|roll|99':>9}{'pitch':>13}{'alt':>14}"
+    print(hdr); print("-" * len(hdr))
+    for f in files:
+        d = _file_md5(f)
+        if d in seen:
+            print(f"{f.name[:27]:<28}  duplicate of {seen[d]}"); continue
+        seen[d] = f.name
+        try:
+            segs, info = parse_bin_file_full(f, **kw)
+        except Exception as e:  # report and continue
+            print(f"{f.name[:27]:<28}  ERROR {e}"); continue
+        line = f"{f.name[:27]:<28}{info['source']:>8}{info['flying_s']:>7.0f}{info['in_mode_flying_s']:>7.0f}{info['sparse_flying_s']:>7.0f}{info['bad_gps_or_ekf_s']:>7.0f}{len(segs):>5}"
+        if segs:
+            s = np.concatenate(segs); all_segs.extend(segs)
+            spd = np.linalg.norm(s[:, COL["vN"]:COL["vD"] + 1], axis=1).mean()
+            asp = np.nanmean(s[:, COL["airspeed"]]) if np.isfinite(s[:, COL["airspeed"]]).any() else float("nan")
+            r99 = np.degrees(np.percentile(np.abs(s[:, COL["roll"]]), 99))
+            p = np.degrees(s[:, COL["pitch"]]); a = s[:, COL["alt"]]
+            line += f"{spd:>7.1f}{asp:>6.1f}{r99:>9.0f}{p.min():>6.0f}..{p.max():<5.0f}{a.min():>6.0f}..{a.max():<6.0f}"
+        print(line)
+    if all_segs:
+        s = np.concatenate(all_segs)
+        L = kw.get("min_mission_samples", 250)
+        print(f"\nTotal: {len(all_segs)} segments, {len(s)} samples "
+              f"({len(s) * kw.get('resample_hz', 10.0) ** -1 / 60:.1f} min), "
+              f"mean speed {_mean_speed(all_segs):.1f} m/s, segments >= {L} samples.")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
+    ap = argparse.ArgumentParser(description="Print per-log parsing diagnostics")
+    ap.add_argument("--data_dir", default="data/")
+    ap.add_argument("--resample_hz", type=float, default=10.0)
+    ap.add_argument("--min_mission_samples", type=int, default=256)
+    ap.add_argument("--min_speed_ms", type=float, default=10.0)
+    ap.add_argument("--modes", nargs="+", default=["AUTO"])
+    ap.add_argument("--max_gap_s", type=float, default=0.3)
+    ap.add_argument("--config", default=None, help="take all settings from a YAML config instead")
+    a = ap.parse_args()
+    if a.config:
+        import yaml
+        d = yaml.safe_load(open(a.config))["data"]
+        _diagnose(d["data_dir"], min_mission_samples=d.get("min_mission_samples", 256),
+                  resample_hz=d.get("resample_hz", 10.0), modes=d.get("modes", ["AUTO"]),
+                  min_speed_ms=d.get("min_speed_ms", 10.0), max_gap_s=d.get("max_gap_s", 0.3),
+                  gps_timeout_s=d.get("gps_timeout_s", 1.0), max_pos_jump_m=d.get("max_pos_jump_m", 3.0))
+    else:
+        _diagnose(a.data_dir, min_mission_samples=a.min_mission_samples, resample_hz=a.resample_hz,
+                  modes=a.modes, min_speed_ms=a.min_speed_ms, max_gap_s=a.max_gap_s)

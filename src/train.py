@@ -95,7 +95,7 @@ def train(config: dict):
 
     # ── Data ─────────────────────────────────────────────────────────────────
     logger.info(f"Loading trajectories from: {config['data']['data_dir']}")
-    trajectories, mean_dt_s = parse_directory(
+    trajectories, mean_dt_s, mean_speed_ms = parse_directory(
         config["data"]["data_dir"],
         min_mission_samples=config["data"]["min_mission_samples"],
     )
@@ -172,10 +172,11 @@ def train(config: dict):
         loss_log_path.write_text("epoch,train_loss,val_loss,elapsed_s\n")
 
     # ── Training epochs ───────────────────────────────────────────────────────
-    epochs      = config["training"]["epochs"]
-    ckpt_every  = config["training"]["checkpoint_every"]
-    grad_clip   = config["training"]["grad_clip"]
-    T           = config["diffusion"]["T"]
+    epochs        = config["training"]["epochs"]
+    ckpt_every    = config["training"]["checkpoint_every"]
+    grad_clip     = config["training"]["grad_clip"]
+    lambda_smooth = config["training"].get("lambda_smooth", 0.1)
+    T             = config["diffusion"]["T"]
 
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
@@ -201,7 +202,20 @@ def train(config: dict):
             eps_pred = model(x_t, t)
 
             # Simplified DDPM loss:  L = ||ε - ε̂_θ||²
-            loss = F.mse_loss(eps_pred, noise)
+            loss_mse = F.mse_loss(eps_pred, noise)
+            
+            # Smoothness constraint on predicted x0 (roll and pitch)
+            # x0_pred has shape [B, 3, L] -> index 0: roll, 1: pitch, 2: alt
+            x0_pred = scheduler.predict_x0_from_eps(x_t, t, eps_pred)
+            x0_pred = x0_pred.clamp(-5.0, 5.0)  # Prevent explosion at large t
+            
+            # Compute 2nd derivatives (Laplacian)
+            # grad2 = x[i+1] - 2x[i] + x[i-1]
+            roll_grad2 = x0_pred[:, 0, 2:] - 2 * x0_pred[:, 0, 1:-1] + x0_pred[:, 0, :-2]
+            pitch_grad2 = x0_pred[:, 1, 2:] - 2 * x0_pred[:, 1, 1:-1] + x0_pred[:, 1, :-2]
+            
+            loss_smooth = (roll_grad2 ** 2).mean() + (pitch_grad2 ** 2).mean()
+            loss = loss_mse + lambda_smooth * loss_smooth
 
             optimizer.zero_grad()
             loss.backward()

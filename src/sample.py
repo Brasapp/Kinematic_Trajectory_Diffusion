@@ -73,6 +73,7 @@ import argparse
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import yaml
@@ -89,7 +90,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-FEATURE_NAMES = ["N_m", "E_m", "D_m", "vN_ms", "vE_ms", "vD_ms", "yaw_rad", "roll_rad", "pitch_rad"]
+FEATURE_NAMES = ["N_m", "E_m", "alt_m", "yaw_rad", "roll_rad", "pitch_rad"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -196,6 +197,34 @@ def ddim_sample(
 # MAIN SAMPLING FUNCTION
 # ──────────────────────────────────────────────────────────────────────────────
 
+def reconstruct_trajectory(roll: np.ndarray, pitch: np.ndarray, alt: np.ndarray, 
+                           v_nominal: float, dt: float) -> np.ndarray:
+    """
+    Reconstruct full trajectory using forward integration (dead-reckoning).
+    
+    Parameters
+    ----------
+    roll, pitch, alt : ndarray[L]
+    v_nominal : float
+    dt : float
+    
+    Returns
+    -------
+    traj : ndarray[L, 6] -> [N_m, E_m, alt_m, yaw_rad, roll_rad, pitch_rad]
+    """
+    L = len(roll)
+    N = np.zeros(L)
+    E = np.zeros(L)
+    yaw = np.zeros(L)
+    g = 9.81
+    
+    for i in range(L - 1):
+        yaw[i+1] = yaw[i] + (g * np.tan(roll[i]) / v_nominal) * dt
+        N[i+1] = N[i] + v_nominal * np.cos(yaw[i]) * dt
+        E[i+1] = E[i] + v_nominal * np.sin(yaw[i]) * dt
+        
+    return np.stack([N, E, alt, yaw, roll, pitch], axis=1)
+
 def sample(config: dict, checkpoint_path: str):
     """Load a trained model and generate synthetic UAV trajectories.
 
@@ -209,7 +238,7 @@ def sample(config: dict, checkpoint_path: str):
 
     # ── Rebuild dataset statistics for denormalisation ────────────────────────
     logger.info("Loading dataset to recover normalisation statistics …")
-    trajectories, mean_dt_s = parse_directory(
+    trajectories, mean_dt_s, mean_speed_ms = parse_directory(
         config["data"]["data_dir"],
         min_mission_samples=config["data"]["min_mission_samples"],
     )
@@ -243,15 +272,15 @@ def sample(config: dict, checkpoint_path: str):
     # ── Kinematic guidance ────────────────────────────────────────────────────
     guidance = KinematicGuidance(
         guidance_scale=config["diffusion"]["guidance_scale"],
-        lambda_vel=config["diffusion"]["lambda_vel"],
         lambda_roll=config["diffusion"]["lambda_roll"],
         lambda_pitch=config["diffusion"]["lambda_pitch"],
-        lambda_coord=config["diffusion"]["lambda_coord"],
-        yaw_channel=6,
-        roll_channel=7,
-        pitch_channel=8,
-        vel_channels=slice(3, 6),
+        roll_channel=0,
+        pitch_channel=1,
+        alt_channel=2,
         dt=dataset.mean_dt_s,
+        v_nominal=mean_speed_ms,
+        means=torch.tensor(dataset.mean, dtype=torch.float32),
+        stds=torch.tensor(dataset.std, dtype=torch.float32),
     )
 
     # ── DDIM sampling ─────────────────────────────────────────────────────────
@@ -268,7 +297,7 @@ def sample(config: dict, checkpoint_path: str):
     )  # [B, 9, L]  — normalised
 
     # ── Denormalise ───────────────────────────────────────────────────────────
-    x_phys = dataset.denormalise(x_norm)  # [B, 9, L]  — physical units
+    x_phys = dataset.denormalise(x_norm)  # [B, 3, L]  — physical units
 
     # ── Export to CSV ─────────────────────────────────────────────────────────
     output_path = Path(config["sampling"]["output_csv"])
@@ -277,8 +306,14 @@ def sample(config: dict, checkpoint_path: str):
     B, F, L = x_phys.shape
     rows = []
     for sample_idx in range(B):
-        traj = x_phys[sample_idx].cpu().numpy().T  # [L, 9]
-        for step_idx, features_row in enumerate(traj):
+        # x_phys[sample_idx] is [3, L] -> roll, pitch, alt
+        roll = x_phys[sample_idx, 0].cpu().numpy()
+        pitch = x_phys[sample_idx, 1].cpu().numpy()
+        alt = x_phys[sample_idx, 2].cpu().numpy()
+        
+        traj_6d = reconstruct_trajectory(roll, pitch, alt, mean_speed_ms, dataset.mean_dt_s)
+        
+        for step_idx, features_row in enumerate(traj_6d):
             row = {"sample_id": sample_idx, "step": step_idx}
             for feat_name, val in zip(FEATURE_NAMES, features_row):
                 row[feat_name] = float(val)

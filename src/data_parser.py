@@ -18,8 +18,8 @@ Pipeline
     equirectangular projection anchored at the first valid GPS fix.
 5.  Align all message streams to a common timestamp grid via linear
     interpolation.
-6.  Produce a feature tensor of shape ``[T, 7]`` with columns
-    ``[N, E, D, vN, vE, vD, yaw_rad]``.
+6.  Produce a feature tensor of shape ``[T, 3]`` with columns
+    ``[roll_rad, pitch_rad, alt_m]``.
 7.  ``TrajectoryDataset`` wraps all parsed tensors, applies Z-score
     normalisation, and yields fixed-length sliding windows suitable for
     the diffusion model.
@@ -274,12 +274,12 @@ def _build_trajectory(
     start_us: float,
     end_us: float,
 ) -> Optional[tuple]:
-    """Build a [T, 9] trajectory array for a single AUTO-mode interval.
+    """Build a [T, 3] trajectory array for a single AUTO-mode interval.
 
-    Feature columns: [N, E, D, vN, vE, vD, yaw_rad, roll_rad, pitch_rad]
+    Feature columns: [roll_rad, pitch_rad, alt_m]
 
-    Also estimates the mean GPS sample interval dt_s (seconds/step) from
-    the actual log timestamps, used later for the coordinated-turn constraint.
+    Also estimates the mean GPS sample interval dt_s (seconds/step) and the mean
+    velocity (m/s) during the interval.
 
     Parameters
     ----------
@@ -289,7 +289,7 @@ def _build_trajectory(
 
     Returns
     -------
-    (traj, dt_s) : (ndarray[T, 9], float) or None if too few points
+    (traj, dt_s, speed_mean) : (ndarray[T, 3], float, float) or None if too few points
     """
     gps = streams["gps"]
     t_gps = gps["t"]
@@ -323,41 +323,32 @@ def _build_trajectory(
     roll_rad  = np.deg2rad(roll_deg)   # [T]
     pitch_rad = np.deg2rad(pitch_deg)  # [T]
 
-    # Velocity: prefer NKF1, fallback to central differences of NED
+    # ── Calculate mean speed ────────────────────────────────────────────────
     if len(streams["nkf1"]["t"]) > 1:
         vn = _interp(streams["nkf1"]["t"], streams["nkf1"]["vn"], t_ref)
         ve = _interp(streams["nkf1"]["t"], streams["nkf1"]["ve"], t_ref)
         vd = _interp(streams["nkf1"]["t"], streams["nkf1"]["vd"], t_ref)
+        speed = np.sqrt(vn**2 + ve**2 + vd**2)
     else:
-        logger.debug("NKF1 not found — computing velocity by finite differences.")
-        dt = np.diff(t_ref) / 1e6  # convert us -> s
-        dt = np.where(dt == 0, 1e-6, dt)  # avoid division by zero
+        # Fallback to horizontal GPS displacement
+        ned = latlon_to_ned(lat, lng, alt, lat[0], lng[0], alt[0])
+        dt = np.diff(t_ref) / 1e6
+        dt = np.where(dt == 0, 1e-6, dt)
+        dn = np.diff(ned[:, 0]) / dt
+        de = np.diff(ned[:, 1]) / dt
+        dd = np.diff(ned[:, 2]) / dt
+        speed = np.sqrt(dn**2 + de**2 + dd**2)
+    
+    speed_mean = float(np.mean(speed)) if len(speed) > 0 else 15.0
 
-        def _central_diff(x, dt):
-            grad = np.empty_like(x)
-            grad[1:-1] = (x[2:] - x[:-2]) / (dt[1:] + dt[:-1])
-            grad[0]    = (x[1] - x[0]) / dt[0]
-            grad[-1]   = (x[-1] - x[-2]) / dt[-1]
-            return grad
-
-        vn = _central_diff(ned[:, 0], dt)
-        ve = _central_diff(ned[:, 1], dt)
-        vd = _central_diff(ned[:, 2], dt)
-
-    # Stack into [T, 9]: position + velocity + attitude
+    # Stack into [T, 3]: Attitude + Altitude (positive-UP)
     traj = np.stack([
-        ned[:, 0],   # N   (m)
-        ned[:, 1],   # E   (m)
-        ned[:, 2],   # D   (m)
-        vn,          # vN  (m/s)
-        ve,          # vE  (m/s)
-        vd,          # vD  (m/s)
-        yaw_rad,     # yaw   (rad)
         roll_rad,    # roll  (rad)
         pitch_rad,   # pitch (rad)
+        alt,         # alt   (m) positive up
     ], axis=-1).astype(np.float32)
 
-    return traj, dt_s
+    return traj, dt_s, speed_mean
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -380,8 +371,9 @@ def parse_bin_file(
 
     Returns
     -------
-    trajectories : list of ndarray[T_i, 9]
+    trajectories : list of ndarray[T_i, 3]
     mean_dt_s    : float — mean GPS sample interval in seconds
+    mean_speed_ms: float — mean flight speed in m/s
 
     Raises
     ------
@@ -408,11 +400,12 @@ def parse_bin_file(
     # Step 3: build a trajectory for each AUTO interval
     trajectories: List[np.ndarray] = []
     dt_samples: List[float] = []
+    speed_samples: List[float] = []
     for i, (start_us, end_us) in enumerate(intervals):
         result = _build_trajectory(streams, start_us, end_us)
         if result is None:
             continue
-        traj, dt_s = result
+        traj, dt_s, speed = result
         if len(traj) < min_mission_samples:
             logger.debug(
                 f"Interval {i}: skipped "
@@ -420,6 +413,8 @@ def parse_bin_file(
             )
             continue
         trajectories.append(traj)
+        dt_samples.append(dt_s)
+        speed_samples.append(speed)
         logger.info(f"Interval {i}: kept — {len(traj)} samples.")
 
     if not trajectories:
@@ -429,7 +424,8 @@ def parse_bin_file(
         )
 
     mean_dt_s = float(np.mean(dt_samples)) if dt_samples else 0.1
-    return trajectories, mean_dt_s
+    mean_speed_ms = float(np.mean(speed_samples)) if speed_samples else 15.0
+    return trajectories, mean_dt_s, mean_speed_ms
 
 
 def parse_directory(
@@ -447,8 +443,9 @@ def parse_directory(
 
     Returns
     -------
-    all_trajectories : list of ndarray[T_i, 9]
+    all_trajectories : list of ndarray[T_i, 3]
     mean_dt_s        : float — mean GPS sample interval in seconds
+    mean_speed_ms    : float — mean flight speed across all logs
     """
     data_dir = Path(data_dir)
     bin_files = sorted(data_dir.glob("*.bin"))
@@ -457,11 +454,13 @@ def parse_directory(
 
     all_trajectories: List[np.ndarray] = []
     all_dts: List[float] = []
+    all_speeds: List[float] = []
     for f in bin_files:
         try:
-            trajs, dt_s = parse_bin_file(str(f), min_mission_samples)
+            trajs, dt_s, speed_ms = parse_bin_file(str(f), min_mission_samples)
             all_trajectories.extend(trajs)
             all_dts.append(dt_s)
+            all_speeds.append(speed_ms)
             logger.info(f"{f.name}: {len(trajs)} segment(s) extracted.")
         except ValueError as e:
             logger.warning(f"{f.name}: skipped — {e}")
@@ -470,7 +469,8 @@ def parse_directory(
         raise ValueError(f"No valid trajectories extracted from {data_dir}")
 
     mean_dt_s = float(np.mean(all_dts)) if all_dts else 0.1
-    return all_trajectories, mean_dt_s
+    mean_speed_ms = float(np.mean(all_speeds)) if all_speeds else 15.0
+    return all_trajectories, mean_dt_s, mean_speed_ms
 
 
 # ──────────────────────────────────────────────────────────────────────────────

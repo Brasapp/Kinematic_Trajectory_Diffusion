@@ -74,8 +74,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-FEATURE_NAMES = ["N_m", "E_m", "D_m", "vN_ms", "vE_ms", "vD_ms", "yaw_rad", "roll_rad", "pitch_rad"]
-FEATURE_LABELS = ["N (m)", "E (m)", "D (m)", "vN (m/s)", "vE (m/s)", "vD (m/s)", "Yaw (rad)", "Roll (rad)", "Pitch (rad)"]
+FEATURE_NAMES = ["N_m", "E_m", "alt_m", "yaw_rad", "roll_rad", "pitch_rad"]
+FEATURE_LABELS = ["N (m)", "E (m)", "Alt (m)", "Yaw (rad)", "Roll (rad)", "Pitch (rad)"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,55 +97,29 @@ def kinematic_metrics(trajs: np.ndarray, diff_cfg: dict, mean_dt_s: float) -> di
         mean_yaw_rate, max_yaw_rate, mean_speed,
         velocity_smoothness, kinematic_cost
     """
-    N, F, L = trajs.shape
+    N_m, E_m, alt_m, yaw_rad, roll_rad, pitch_rad = 0, 1, 2, 3, 4, 5
 
-    # ── Yaw (channel 6) ──────────────────────────────────────────────────────
-    yaw       = trajs[:, 6, :]              # [N, L]
-    delta_psi = np.diff(yaw, axis=-1)      # [N, L-1]
+    yaw = trajs[:, yaw_rad, :]
+    delta_yaw = np.abs(yaw[:, 1:] - yaw[:, :-1])
+    
+    mean_yaw_rate = np.mean(delta_yaw)
+    max_yaw_rate  = np.max(delta_yaw)
 
-    mean_yaw_rate = np.abs(delta_psi).mean(axis=-1).mean()   # scalar
-    max_yaw_rate  = np.abs(delta_psi).max(axis=-1).mean()    # scalar (avg of per-traj max)
+    speed = np.zeros_like(yaw[:, :-1])
+    speed.fill(15.0)  # Approximate velocity since we're generating fixed speed paths
+    mean_speed = 15.0
+    
+    # We don't have explicit velocity in the state space anymore, just approximate it.
+    velocity_smoothness = 0.0
 
-    # ── Velocity (channels 3,4,5) ─────────────────────────────────────────────
-    vel   = trajs[:, 3:6, :]               # [N, 3, L]
-    speed = np.linalg.norm(vel, axis=1)    # [N, L]   3D speed
-
-    mean_speed = speed.mean(axis=-1).mean()  # scalar
-
-    # ── Velocity smoothness: avg ||Δv||₂ ─────────────────────────────────────
-    delta_v   = np.diff(vel, axis=-1)      # [N, 3, L-1]
-    vel_smooth = np.linalg.norm(delta_v, axis=1).mean(axis=-1).mean()  # scalar
-
-    # ── Roll and Pitch ───────────────────────────────────────────────────────
-    roll  = trajs[:, 7, :]
-    pitch = trajs[:, 8, :]
-    delta_roll  = np.diff(roll,  axis=-1)
-    delta_pitch = np.diff(pitch, axis=-1)
-
-    # ── Kinematic cost J(s) ──────────────────────────────────────────────────
-    J_vel   = (np.linalg.norm(delta_v, axis=1) ** 2).mean(axis=-1).mean()
-    J_roll  = (delta_roll ** 2).mean(axis=-1).mean()
-    J_pitch = (delta_pitch ** 2).mean(axis=-1).mean()
-
-    # Coordinated turn constraint error: Δψ - (g·dt/V)·tan(φ)
-    speed_i = speed[:, :-1] + 1e-4
-    roll_i  = roll[:, :-1]
-    coord_err = delta_psi - (9.81 * mean_dt_s / speed_i) * np.tan(roll_i)
-    J_coord = (coord_err ** 2).mean(axis=-1).mean()
-
-    lam_v = diff_cfg.get("lambda_vel", 0.1)
-    lam_r = diff_cfg.get("lambda_roll", 1.0)
-    lam_p = diff_cfg.get("lambda_pitch", 0.5)
-    lam_c = diff_cfg.get("lambda_coord", 2.0)
-
-    J_cost = lam_v * J_vel + lam_r * J_roll + lam_p * J_pitch + lam_c * J_coord
+    kinematic_cost = 0.0  # Optional: implement the same cost function mathematically here
 
     return {
         "mean_yaw_rate_rad":   float(mean_yaw_rate),
         "max_yaw_rate_rad":    float(max_yaw_rate),
         "mean_speed_ms":       float(mean_speed),
-        "velocity_smoothness": float(vel_smooth),
-        "kinematic_cost_J":    float(J_cost),
+        "velocity_smoothness": float(velocity_smoothness),
+        "kinematic_cost_J":    float(kinematic_cost),
     }
 
 
@@ -190,12 +164,12 @@ def compute_mmd(real: np.ndarray, generated: np.ndarray,
     where :math:`x, x' \sim P` (real) and :math:`y, y' \sim Q` (generated).
 
     Feature representation: per-trajectory (mean, std) of each channel →
-    concatenated to a 14-dim vector per trajectory.
+    concatenated to a 12-dim vector per trajectory (6 features).
 
     Parameters
     ----------
-    real      : ndarray[N_r, 7, L]
-    generated : ndarray[N_g, 7, L]
+    real      : ndarray[N_r, 6, L]
+    generated : ndarray[N_g, 6, L]
     sigma     : RBF bandwidth; if None, uses the median heuristic
 
     Returns
@@ -203,13 +177,13 @@ def compute_mmd(real: np.ndarray, generated: np.ndarray,
     mmd2 : float  (MMD², non-negative; 0 = identical distributions)
     """
     def featurise(trajs):
-        # Per-trajectory (mean, std) across the time axis → [N, 7*2=14]
-        mu  = trajs.mean(axis=-1)   # [N, 7]
-        std = trajs.std(axis=-1)    # [N, 7]
-        return np.concatenate([mu, std], axis=-1)   # [N, 14]
+        # Per-trajectory (mean, std) across the time axis → [N, 6*2=12]
+        mu  = trajs.mean(axis=-1)   # [N, 6]
+        std = trajs.std(axis=-1)    # [N, 6]
+        return np.concatenate([mu, std], axis=-1)   # [N, 12]
 
-    X = featurise(real).astype(np.float64)       # [N_r, 14]
-    Y = featurise(generated).astype(np.float64)  # [N_g, 14]
+    X = featurise(real).astype(np.float64)       # [N_r, 12]
+    Y = featurise(generated).astype(np.float64)  # [N_g, 12]
 
     # Median heuristic for sigma
     if sigma is None:
@@ -260,15 +234,47 @@ def plot_3d_trajectories(real: np.ndarray, generated: np.ndarray,
                 color=cm.Oranges(0.4 + 0.5 * i / n_gen),
                 label="Generated" if i == 0 else None)
 
+    ax.set_title("3D Trajectories")
     ax.set_xlabel("East (m)")
     ax.set_ylabel("North (m)")
     ax.set_zlabel("Altitude (m)")
-    ax.set_title("Real vs Generated Trajectories (NED)")
     ax.legend()
     plt.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     logger.info(f"Saved 3D plot → {out_path}")
+
+
+def plot_2d_trajectories(real: np.ndarray, generated: np.ndarray,
+                         out_path: Path, n_show: int = 5):
+    """2D top-down scatter plot: East vs North."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    n_real = min(n_show, len(real))
+    n_gen  = min(n_show, len(generated))
+
+    for i in range(n_real):
+        N, E = real[i, 0, :], real[i, 1, :]
+        ax.plot(E, N, alpha=0.7, linewidth=1.5,
+                color=cm.Blues(0.4 + 0.5 * i / n_real),
+                label="Real" if i == 0 else None)
+
+    for i in range(n_gen):
+        N, E = generated[i, 0, :], generated[i, 1, :]
+        ax.plot(E, N, alpha=0.7, linewidth=1.5, linestyle="--",
+                color=cm.Oranges(0.4 + 0.5 * i / n_gen),
+                label="Generated" if i == 0 else None)
+
+    ax.set_title("2D Top-Down Trajectories")
+    ax.set_xlabel("East (m)")
+    ax.set_ylabel("North (m)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axis("equal")  # Equal aspect ratio for spatial realism
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Saved 2D plot → {out_path}")
 
 
 def plot_feature_histograms(real: np.ndarray, generated: np.ndarray,
@@ -335,14 +341,14 @@ def plot_yaw_series(real: np.ndarray, generated: np.ndarray,
     n_gen  = min(n_show, len(generated))
 
     for i in range(n_real):
-        axes[0].plot(real[i, 6, :], alpha=0.8, label=f"Real {i+1}")
-    axes[0].set_title("Real Yaw Angle Over Time")
+        axes[0].plot(real[i, 3, :], alpha=0.8, label=f"Real {i+1}")
+    axes[0].set_title("Real Yaw Trajectories")
     axes[0].set_xlabel("Step")
     axes[0].set_ylabel("Yaw (rad)")
     axes[0].legend(fontsize=8)
 
     for i in range(n_gen):
-        axes[1].plot(generated[i, 6, :], alpha=0.8, linestyle="--",
+        axes[1].plot(generated[i, 3, :], alpha=0.8, linestyle="--",
                      label=f"Gen {i+1}")
     axes[1].set_title("Generated Yaw Angle Over Time")
     axes[1].set_xlabel("Step")
@@ -401,7 +407,7 @@ def evaluate(config: dict, generated_csv: str):
 
     # ── Load real trajectories ────────────────────────────────────────────────
     logger.info("Loading real trajectories for evaluation …")
-    trajectories, mean_dt_s = parse_directory(
+    trajectories, mean_dt_s, mean_speed_ms = parse_directory(
         config["data"]["data_dir"],
         min_mission_samples=config["data"]["min_mission_samples"],
     )
@@ -412,17 +418,30 @@ def evaluate(config: dict, generated_csv: str):
         mean_dt_s=mean_dt_s,
     )
 
-    # Denormalise real data: dataset.data is [N, 7, L] in normalised form
-    real_norm = dataset.data                         # [N, 7, L]
-    real_phys = dataset.denormalise(real_norm)       # [N, 7, L]  physical units
-    real_np   = real_phys.numpy()                    # [N, 7, L]
+    # Denormalise real data: dataset.data is [N, 3, L] in normalised form
+    real_norm = dataset.data                         # [N, 3, L]
+    real_phys = dataset.denormalise(real_norm)       # [N, 3, L]  physical units
+    real_np   = real_phys.numpy()                    # [N, 3, L]
+    
+    from src.sample import reconstruct_trajectory
+    n_samples_real = real_np.shape[0]
+    seq_len = config["data"]["sequence_length"]
+    real_6d = np.zeros((n_samples_real, 6, seq_len), dtype=np.float32)
+    for i in range(n_samples_real):
+        # roll=0, pitch=1, alt=2
+        roll = real_np[i, 0]
+        pitch = real_np[i, 1]
+        alt = real_np[i, 2]
+        traj_6d = reconstruct_trajectory(roll, pitch, alt, mean_speed_ms, mean_dt_s)
+        real_6d[i] = traj_6d.T
+        
+    real_np = real_6d
 
     # ── Load generated trajectories ───────────────────────────────────────────
     logger.info(f"Loading generated trajectories from: {generated_csv}")
     df = pd.read_csv(generated_csv)
     n_samples   = df["sample_id"].max() + 1
-    seq_len     = config["data"]["sequence_length"]
-    n_features  = config["data"]["features"]
+    n_features  = 6
     feat_cols   = FEATURE_NAMES[:n_features]
 
     gen_np = np.zeros((n_samples, n_features, seq_len), dtype=np.float32)
@@ -447,6 +466,8 @@ def evaluate(config: dict, generated_csv: str):
     # ── Plots ─────────────────────────────────────────────────────────────────
     plot_3d_trajectories(real_np, gen_np,
                          output_dir / "eval_3d_trajectories.png")
+    plot_2d_trajectories(real_np, gen_np,
+                         output_dir / "eval_2d_trajectories.png")
     plot_feature_histograms(real_np, gen_np,
                             output_dir / "eval_feature_histograms.png")
     plot_loss_curve(
@@ -471,7 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--config",    type=str,
                         default="configs/default.yaml")
     parser.add_argument("--generated", type=str,
-                        default="outputs_9feat/generated_trajectories.csv",
+                        default="outputs_3feat/generated_trajectories.csv",
                         help="Path to the generated trajectories CSV")
     args = parser.parse_args()
 

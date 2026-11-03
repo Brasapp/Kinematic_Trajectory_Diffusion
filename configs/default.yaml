@@ -4,10 +4,10 @@
 
 data:
   data_dir: "data/"                # Directory containing raw .bin ArduPilot logs
-  output_dir: "outputs_9feat/"           # Generated trajectory CSVs saved here
-  checkpoint_dir: "checkpoints_9feat/"   # Model weight snapshots saved here
+  output_dir: "outputs_3feat/"           # Generated trajectory CSVs saved here
+  checkpoint_dir: "checkpoints_3feat/"   # Model weight snapshots saved here
   sequence_length: 256             # Fixed window length (samples) for each trajectory segment
-  features: 9                      # [N, E, D, vN, vE, vD, yaw, roll, pitch]
+  features: 3                      # [roll, pitch, alt]
   min_mission_samples: 250         # Minimum AUTO-mode samples for a segment to be kept
   stride: 128                      # Sliding window stride (overlap = sequence_length - stride)
 
@@ -16,12 +16,11 @@ diffusion:
   s: 0.008                         # Cosine schedule offset (Nichol & Dhariwal 2021, Appendix B)
   guidance_scale: 2.0              # w: kinematic guidance strength
   lambda_vel: 0.1                  # weight of velocity-change penalty
-  lambda_roll: 1.0                 # weight of roll-rate penalty
-  lambda_pitch: 0.5                # weight of pitch-rate penalty
-  lambda_coord: 2.0                # weight of coordinated-turn constraint
+  lambda_pitch: 1.0                # Weight for pitch-altitude correlation
+  lambda_roll: 0.5                 # Weight for roll smoothness
 
 model:
-  in_channels: 9                   # Must match data.features
+  in_channels: 3                   # Must match data.features
   base_channels: 64                # Width of the shallowest U-Net level
   depth: 3                         # Number of encoder/decoder stages
   time_emb_dim: 128                # Dimension of sinusoidal time embedding
@@ -35,9 +34,10 @@ training:
   num_workers: 4
   seed: 42
   grad_clip: 1.0                   # Gradient clipping max norm
+  lambda_smooth: 0.1               # Weight for predicted x_0 smoothness loss
 
 sampling:
   num_samples: 8                   # Number of trajectories to generate per run
   ddim_steps: 50                   # DDIM inference steps (fast; S << T)
   eta: 0.0                         # DDIM stochasticity: 0 = deterministic, 1 = DDPM-equivalent
-  output_csv: "outputs_9feat/generated_trajectories.csv"
+  output_csv: "outputs_3feat/generated_trajectories.csv"

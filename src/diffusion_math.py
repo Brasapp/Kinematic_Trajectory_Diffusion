@@ -244,28 +244,33 @@ class KinematicGuidance:
     The cost function :math:`J(\mathbf{s})` penalises two types of physically
     unnatural motion in a UAV trajectory:
 
-    **Term 1 — Yaw-rate penalty** (sharp, unnatural turns)
+    **Term 1 — Pitch-Altitude Coupling** (Ensures altitude changes match pitch attitude)
 
     .. math::
 
-        J_{\psi}(\mathbf{s}) = \sum_{i=1}^{T-1} (\psi_{i+1} - \psi_i)^2
+        J_{pitch}(\mathbf{s}) = \sum_{i=1}^{T-1} \left( \frac{z_{i+1} - z_i}{\Delta t} - v \sin(\theta_i) \right)^2
 
-    where :math:`\psi_i` is the yaw angle (radians) at step :math:`i`.
+    where :math:`z_i` is altitude, :math:`\theta_i` is pitch, and :math:`v` is nominal velocity.
 
-    **Term 2 — Velocity-change penalty** (abrupt accelerations)
+    **Term 2 — Roll Smoothness** (Penalises extreme roll rates)
 
     .. math::
 
-        J_{v}(\mathbf{s}) = \sum_{i=1}^{T-1}
-            \left\|\mathbf{v}_{i+1} - \mathbf{v}_i\right\|^2
+        J_{roll}(\mathbf{s}) = \sum_{i=1}^{T-1} (\phi_{i+1} - \phi_i)^2
 
-    where :math:`\mathbf{v}_i = (v_N, v_E, v_D)_i`.
+    where :math:`\phi_i` is roll.
+
+    **Term 3 — Strict Attitude Boundaries** (Enforces physical roll and pitch limits)
+
+    .. math::
+
+        J_{boundary}(\mathbf{s}) = \lambda_{roll} \sum \max(0, |\phi| - \phi_{max})^2 + \lambda_{pitch} \sum \left( \max(0, \theta_{min} - \theta)^2 + \max(0, \theta - \theta_{max})^2 \right)
 
     **Combined cost**
 
     .. math::
 
-        J(\mathbf{s}) = J_{\psi}(\mathbf{s}) + \lambda \, J_{v}(\mathbf{s})
+        J(\mathbf{s}) = \lambda_{roll} \, J_{roll}(\mathbf{s}) + \lambda_{pitch} \, J_{pitch}(\mathbf{s}) + J_{boundary}(\mathbf{s})
 
     During sampling, the gradient :math:`\nabla_{\mathbf{x}_t} J` is computed
     via ``torch.autograd.grad`` and subtracted from the predicted clean
@@ -281,40 +286,51 @@ class KinematicGuidance:
     ----------
     guidance_scale : float
         :math:`w` — strength of guidance.  0 = no guidance, larger = smoother.
-    lambda_vel : float
-        :math:`\lambda` — relative weight of the velocity-change penalty.
-    yaw_channel : int
-        Feature channel index of the yaw angle in the trajectory tensor.
-        Default ``6`` for feature order ``[N, E, D, vN, vE, vD, yaw]``.
-    vel_channels : slice
-        Feature channel slice of velocity components ``[vN, vE, vD]``.
-        Default ``slice(3, 6)``.
+    lambda_roll : float
+        Weight of the roll smoothness penalty.
+    lambda_pitch : float
+        Weight of the pitch-altitude coupling penalty.
+    roll_channel : int
+        Feature channel index of the roll angle in the trajectory tensor (default 0).
+    pitch_channel : int
+        Feature channel index of the pitch angle in the trajectory tensor (default 1).
+    alt_channel : int
+        Feature channel index of the altitude in the trajectory tensor (default 2).
+    dt : float
+        Time step delta in seconds.
+    v_nominal : float
+        Nominal flight velocity in m/s.
     """
 
     def __init__(
         self,
         guidance_scale: float = 2.0,
-        lambda_vel: float = 0.1,
-        lambda_roll: float = 1.0,
-        lambda_pitch: float = 0.5,
-        lambda_coord: float = 2.0,
-        yaw_channel: int = 6,
-        roll_channel: int = 7,
-        pitch_channel: int = 8,
-        vel_channels: slice = slice(3, 6),
+        lambda_roll: float = 0.5,
+        lambda_pitch: float = 1.0,
+        roll_channel: int = 0,
+        pitch_channel: int = 1,
+        alt_channel: int = 2,
         dt: float = 0.1,
+        v_nominal: float = 15.0,
+        max_roll_deg: float = 85.0,
+        min_pitch_deg: float = -15.0,
+        max_pitch_deg: float = 25.0,
+        means: torch.Tensor = None,
+        stds: torch.Tensor = None,
     ):
         self.w           = guidance_scale
-        self.lam_v       = lambda_vel
         self.lam_r       = lambda_roll
         self.lam_p       = lambda_pitch
-        self.lam_c       = lambda_coord
-        self.yaw_ch      = yaw_channel
         self.roll_ch     = roll_channel
         self.pitch_ch    = pitch_channel
-        self.vel_sl      = vel_channels
+        self.alt_ch      = alt_channel
         self.dt          = dt
-        self.g           = 9.81
+        self.v_nominal   = v_nominal
+        self.max_roll_rad  = math.radians(max_roll_deg)
+        self.min_pitch_rad = math.radians(min_pitch_deg)
+        self.max_pitch_rad = math.radians(max_pitch_deg)
+        self.means       = means
+        self.stds        = stds
 
     # ── Compute J(s) ─────────────────────────────────────────────────────────
     def compute_cost(self, x: torch.Tensor) -> torch.Tensor:
@@ -322,43 +338,51 @@ class KinematicGuidance:
 
         Parameters
         ----------
-        x : Tensor[B, F, L]
-            Trajectory tensor.  ``x[:, yaw_channel, :]`` contains yaw;
-            ``x[:, vel_channels, :]`` contains (vN, vE, vD).
+        x : Tensor[B, 3, L]
+            Trajectory tensor. ``x[:, 0, :]`` roll, ``x[:, 1, :]`` pitch, ``x[:, 2, :]`` alt.
 
         Returns
         -------
         cost : scalar Tensor
             Mean kinematic cost across the batch.
         """
-        # ── Velocity-change cost ─────────────────────────────────────────────
-        vel = x[:, self.vel_sl, :]
-        delta_v = vel[:, :, 1:] - vel[:, :, :-1]
-        J_vel = (delta_v ** 2).mean()
-
-        # ── Roll-rate and Pitch-rate cost ────────────────────────────────────
-        roll = x[:, self.roll_ch, :]
+        if self.means is not None and self.stds is not None:
+            # Denormalise x to physical units before computing cost
+            mean = self.means.to(x.device).view(1, -1, 1)
+            std = self.stds.to(x.device).view(1, -1, 1)
+            x_phys = x * std + mean
+        else:
+            x_phys = x
+            
+        # ── Roll Smoothness cost ─────────────────────────────────────────────
+        roll = x_phys[:, self.roll_ch, :]
         delta_roll = roll[:, 1:] - roll[:, :-1]
-        J_roll = (delta_roll ** 2).mean()
+        # We can approximate d(phi)/dt as delta_roll / dt
+        J_roll = ((delta_roll / self.dt) ** 2).mean()
 
-        pitch = x[:, self.pitch_ch, :]
-        delta_pitch = pitch[:, 1:] - pitch[:, :-1]
-        J_pitch = (delta_pitch ** 2).mean()
+        # ── Pitch-Altitude Coupling cost ─────────────────────────────────────
+        pitch = x_phys[:, self.pitch_ch, :]
+        alt = x_phys[:, self.alt_ch, :]
+        
+        delta_alt = alt[:, 1:] - alt[:, :-1]
+        pitch_i = pitch[:, :-1]
+        
+        # dZ/dt - V * sin(theta)
+        pitch_err = (delta_alt / self.dt) - self.v_nominal * torch.sin(pitch_i)
+        J_pitch = (pitch_err ** 2).mean()
 
-        # ── Coordinated-turn constraint ──────────────────────────────────────
-        yaw = x[:, self.yaw_ch, :]
-        delta_yaw = yaw[:, 1:] - yaw[:, :-1]
-
-        vel_i = vel[:, :, :-1]
-        speed_i = torch.norm(vel_i, dim=1) + 1e-4  # [B, L-1], guard against div/0
-        roll_i = roll[:, :-1]
-
-        # constraint: delta_psi = (g * dt / V) * tan(phi)
-        coord_err = delta_yaw - (self.g * self.dt / speed_i) * torch.tan(roll_i)
-        J_coord = (coord_err ** 2).mean()
+        # ── Strict Attitude Boundary cost ────────────────────────────────────
+        # Penalise exceeding max_roll, min_pitch, max_pitch
+        roll_bound = torch.nn.functional.relu(torch.abs(roll) - self.max_roll_rad)
+        pitch_min_bound = torch.nn.functional.relu(self.min_pitch_rad - pitch)
+        pitch_max_bound = torch.nn.functional.relu(pitch - self.max_pitch_rad)
+        
+        J_bound = self.lam_r * (roll_bound ** 2).mean() + self.lam_p * (
+            (pitch_min_bound ** 2).mean() + (pitch_max_bound ** 2).mean()
+        )
 
         # ── Combined cost ────────────────────────────────────────────────────
-        J = self.lam_r * J_roll + self.lam_p * J_pitch + self.lam_v * J_vel + self.lam_c * J_coord
+        J = self.lam_r * J_roll + self.lam_p * J_pitch + J_bound
         return J
 
     # ── Compute gradient ∇J via autograd ─────────────────────────────────────
@@ -402,4 +426,6 @@ class KinematicGuidance:
         x0_guided : Tensor[B, F, L]
         """
         grad = self.compute_gradient(x0_pred)
+        # Clip gradient to prevent massive jumps when physical cost is large
+        grad = grad.clamp(-1.0, 1.0)
         return x0_pred - self.w * grad

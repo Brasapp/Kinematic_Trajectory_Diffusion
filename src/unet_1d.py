@@ -16,10 +16,10 @@ maps after GroupNorm.
 
 Input / output shapes::
 
-    x_t  : [B, F, L]  — noisy trajectory (batch, features, sequence_length)
+    x_t  : [B, 3, L]  — noisy trajectory [roll, pitch, alt]
     t    : [B]         — integer diffusion timestep (0 … T-1)
     ↓
-    ε_θ  : [B, F, L]  — predicted noise
+    ε_θ  : [B, 3, L]  — predicted noise
 
 The architecture is intentionally compact (no attention) since UAV trajectories
 are short 1D sequences — not high-resolution images.
@@ -378,7 +378,7 @@ class UNet1D(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    B, F, L = 4, 7, 256
+    B, F, L = 4, 3, 256
     model = UNet1D(in_channels=F, base_channels=64, depth=3, time_emb_dim=128)
     x = torch.randn(B, F, L)
     t = torch.randint(0, 1000, (B,))

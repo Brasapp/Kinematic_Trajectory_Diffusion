@@ -373,6 +373,57 @@ class UNet1D(nn.Module):
         return self.head(h)  # [B, F, L]
 
 
+class MirrorSymmetric(nn.Module):
+    r"""Make a noise predictor exactly left/right symmetric.
+
+    With :math:`M` the mirror (sign flip of the roll channel),
+
+    .. math::
+
+        \hat\epsilon(x, t) = \tfrac12\left[\epsilon_\theta(x, t)
+                                + M\,\epsilon_\theta(Mx, t)\right]
+
+    satisfies :math:`\hat\epsilon(Mx, t) = M\hat\epsilon(x, t)`.  Because the
+    starting noise is symmetric too, the sampled distribution is then exactly
+    mirror-symmetric: left and right turns are equally likely, whatever the
+    network learned.  Both halves run as one batch of size 2B.
+    """
+
+    def __init__(self, net: nn.Module, mirror_channels, in_channels: int):
+        super().__init__()
+        self.net = net
+        sign = torch.ones(1, in_channels, 1)
+        for c in mirror_channels:
+            sign[0, c] = -1.0
+        self.register_buffer("sign", sign, persistent=False)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        out = self.net(torch.cat([x, self.sign * x]), torch.cat([t, t]))
+        return 0.5 * (out[:B] + self.sign * out[B:])
+
+
+def build_model(config: dict) -> nn.Module:
+    """UNet1D from the ``model:`` config, wrapped in MirrorSymmetric when
+    ``model.mirror_symmetric`` and ``data.mirror_roll`` are both on."""
+    m = config["model"]
+    net = UNet1D(
+        in_channels=m["in_channels"],
+        base_channels=m["base_channels"],
+        depth=m["depth"],
+        time_emb_dim=m["time_emb_dim"],
+    )
+    names = list(config["data"].get("feature_names", ["roll", "pitch", "alt"]))
+    if m.get("mirror_symmetric", False) and config["data"].get("mirror_roll", False) and "roll" in names:
+        return MirrorSymmetric(net, [names.index("roll")], m["in_channels"])
+    return net
+
+
+def core_module(model: nn.Module) -> nn.Module:
+    """The bare UNet1D (checkpoints always store its weights)."""
+    return model.net if isinstance(model, MirrorSymmetric) else model
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 4.  QUICK SANITY CHECK
 # ──────────────────────────────────────────────────────────────────────────────

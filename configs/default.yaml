@@ -4,8 +4,8 @@
 
 data:
   data_dir: "data/"                # Directory containing raw .bin ArduPilot logs
-  output_dir: "outputs_v4/"           # Generated trajectory CSVs saved here
-  checkpoint_dir: "checkpoints_v4/"   # Model weight snapshots saved here
+  output_dir: "outputs_v6/"           # Generated trajectory CSVs saved here
+  checkpoint_dir: "checkpoints_v6/"   # Model weight snapshots saved here
   sequence_length: 128             # Window length in samples (12.8 s at 10 Hz; AUTO legs are mostly 15-50 s)
   features: 3                      # [roll, pitch, alt]
   feature_names: [roll, pitch, alt]  # Model channels, picked from data_parser.FULL_COLUMNS
@@ -19,20 +19,28 @@ data:
   stride: 32                       # Sliding window stride (overlap = sequence_length - stride)
   relative_alt: true               # Altitude as change since the window start
   mirror_roll: true                # Randomly mirror roll during training (left/right symmetry)
+  val_fraction: 0.15               # Share of samples held out for validation, split by whole log file
 
 diffusion:
   T: 1000                          # Total forward-process timesteps
   s: 0.008                         # Cosine schedule offset (Nichol & Dhariwal 2021, Appendix B)
-  guidance_scale: 0.0              # w: kinematic guidance strength (0 = off; current guidance adds noise)
-  lambda_vel: 0.1                  # weight of velocity-change penalty
-  lambda_pitch: 1.0                # Weight for pitch-altitude correlation
-  lambda_roll: 0.5                 # Weight for roll smoothness
+  guidance_scale: 0.5              # w: guidance step as a fraction of a full correction (0 = off; keep w*(lambda_roll+lambda_bound) <= 1)
+  lambda_roll: 1.0                 # Weight for roll-acceleration (chatter) penalty
+  lambda_pitch: 1.0                # Weight for pitch-climb coupling (climb = g*sin(pitch) + b, fitted on data)
+  lambda_bound: 1.0                # Weight for attitude-limit penalty
+  max_roll_deg: 90.0               # Roll limit (real AUTO p99.9 = 88 deg)
+  min_pitch_deg: -20.0             # Pitch limits (real AUTO p0.1..p99.9 = -18..37 deg)
+  max_pitch_deg: 40.0
+  pitch_drives_alt: true           # Coupling term corrects altitude only (pitch is the cleaner channel)
+  anchor_alt: true                 # Shift generated altitude so each window starts at 0 m
+  guidance_iters: 1                # Guidance gradient steps per sampling step
 
 model:
   in_channels: 3                   # Must match data.features
   base_channels: 64                # Width of the shallowest U-Net level
   depth: 3                         # Number of encoder/decoder stages
   time_emb_dim: 128                # Dimension of sinusoidal time embedding
+  mirror_symmetric: true           # Average the network with its mirrored self: exact left/right symmetry
 
 training:
   batch_size: 32
@@ -46,7 +54,8 @@ training:
   lambda_smooth: 0.1               # Weight for predicted x_0 smoothness loss
 
 sampling:
-  num_samples: 64                  # Number of trajectories to generate per run
+  num_samples: 256                 # Number of trajectories to generate per run (256 keeps metrics stable)
   ddim_steps: 50                   # DDIM inference steps (fast; S << T)
   eta: 0.0                         # DDIM stochasticity: 0 = deterministic, 1 = DDPM-equivalent
-  output_csv: "outputs_v4/generated_trajectories.csv"
+  seed: 0                          # Sampling seed (remove for a different set each run)
+  output_csv: "outputs_v6/generated_trajectories.csv"

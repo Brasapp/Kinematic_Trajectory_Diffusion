@@ -239,193 +239,151 @@ class CosineNoiseScheduler:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class KinematicGuidance:
-    r"""Differentiable kinematic cost function for guided trajectory sampling.
+    r"""Kinematic guidance applied to the predicted clean trajectory.
 
-    The cost function :math:`J(\mathbf{s})` penalises two types of physically
-    unnatural motion in a UAV trajectory:
+    All terms are evaluated in physical units (radians, metres, seconds) and
+    calibrated on the real AUTO data (see ``calibrate_guidance`` in sample.py).
 
-    **Term 1 — Pitch-Altitude Coupling** (Ensures altitude changes match pitch attitude)
-
-    .. math::
-
-        J_{pitch}(\mathbf{s}) = \sum_{i=1}^{T-1} \left( \frac{z_{i+1} - z_i}{\Delta t} - v \sin(\theta_i) \right)^2
-
-    where :math:`z_i` is altitude, :math:`\theta_i` is pitch, and :math:`v` is nominal velocity.
-
-    **Term 2 — Roll Smoothness** (Penalises extreme roll rates)
+    **Pitch-climb coupling** — climb rate should follow the attitude:
 
     .. math::
 
-        J_{roll}(\mathbf{s}) = \sum_{i=1}^{T-1} (\phi_{i+1} - \phi_i)^2
+        r_i = \frac{1}{\sigma_c}\left(\frac{z_{i+1}-z_i}{\Delta t} - g\sin\theta_i - b\right),
+        \qquad J_{pitch} = \sum_i r_i^2
 
-    where :math:`\phi_i` is roll.
+    :math:`g` (effective speed) and :math:`b` (climb bias, i.e. trim / angle of
+    attack) come from a least-squares fit on the real data; :math:`\sigma_c` is
+    the residual RMS of that fit.
 
-    **Term 3 — Strict Attitude Boundaries** (Enforces physical roll and pitch limits)
-
-    .. math::
-
-        J_{boundary}(\mathbf{s}) = \lambda_{roll} \sum \max(0, |\phi| - \phi_{max})^2 + \lambda_{pitch} \sum \left( \max(0, \theta_{min} - \theta)^2 + \max(0, \theta - \theta_{max})^2 \right)
-
-    **Combined cost**
+    **Roll chatter** — penalises roll *acceleration*, not roll rate, so real
+    turn entries are kept but step-to-step jitter is removed:
 
     .. math::
 
-        J(\mathbf{s}) = \lambda_{roll} \, J_{roll}(\mathbf{s}) + \lambda_{pitch} \, J_{pitch}(\mathbf{s}) + J_{boundary}(\mathbf{s})
+        J_{roll} = \sum_i \left(\frac{\phi_{i+1}-2\phi_i+\phi_{i-1}}{\sigma_{\ddot\phi}}\right)^2
 
-    During sampling, the gradient :math:`\nabla_{\mathbf{x}_t} J` is computed
-    via ``torch.autograd.grad`` and subtracted from the predicted clean
-    trajectory :math:`\hat{\mathbf{x}}_0` with a guidance scale :math:`w`:
+    **Attitude limits** — quadratic penalty outside the real envelope
+    (in units of the channel std).
+
+    **Update rule** — one preconditioned gradient step per term and channel:
 
     .. math::
 
-        \hat{\mathbf{x}}_0^{\text{guided}}
-            = \hat{\mathbf{x}}_0
-            - w \cdot \nabla_{\hat{\mathbf{x}}_0} J(\hat{\mathbf{x}}_0)
+        x_c \leftarrow x_c - w\,\bar\alpha_t \sum_k \lambda_k
+                \frac{\partial J_k / \partial x_c}{L_{k,c}}
 
-    Parameters
-    ----------
-    guidance_scale : float
-        :math:`w` — strength of guidance.  0 = no guidance, larger = smoother.
-    lambda_roll : float
-        Weight of the roll smoothness penalty.
-    lambda_pitch : float
-        Weight of the pitch-altitude coupling penalty.
-    roll_channel : int
-        Feature channel index of the roll angle in the trajectory tensor (default 0).
-    pitch_channel : int
-        Feature channel index of the pitch angle in the trajectory tensor (default 1).
-    alt_channel : int
-        Feature channel index of the altitude in the trajectory tensor (default 2).
-    dt : float
-        Time step delta in seconds.
-    v_nominal : float
-        Nominal flight velocity in m/s.
+    where :math:`L_{k,c}` is the Lipschitz constant of :math:`\nabla J_k` in
+    channel :math:`c`.  With :math:`w\sum_k\lambda_k \le 1` a step can never
+    overshoot, so the guidance cannot make the trajectory oscillate.  The
+    :math:`\bar\alpha_t` factor keeps guidance off while :math:`\hat x_0` is
+    still mostly noise.  Optionally altitude is re-anchored so the window
+    starts at 0 m (the training data is altitude relative to window start).
     """
 
     def __init__(
         self,
-        guidance_scale: float = 2.0,
-        lambda_roll: float = 0.5,
+        guidance_scale: float = 0.0,
+        lambda_roll: float = 1.0,
         lambda_pitch: float = 1.0,
+        lambda_bound: float = 1.0,
         roll_channel: int = 0,
         pitch_channel: int = 1,
         alt_channel: int = 2,
         dt: float = 0.1,
-        v_nominal: float = 15.0,
-        max_roll_deg: float = 85.0,
-        min_pitch_deg: float = -15.0,
-        max_pitch_deg: float = 25.0,
+        climb_gain: float = 30.0,
+        climb_bias: float = 0.0,
+        climb_resid_std: float = 3.0,
+        roll_d2_std: float = 0.06,
+        max_roll_deg: float = 90.0,
+        min_pitch_deg: float = -20.0,
+        max_pitch_deg: float = 40.0,
+        anchor_alt: bool = True,
+        pitch_drives_alt: bool = True,
+        iters: int = 1,
         means: torch.Tensor = None,
         stds: torch.Tensor = None,
     ):
-        self.w           = guidance_scale
-        self.lam_r       = lambda_roll
-        self.lam_p       = lambda_pitch
-        self.roll_ch     = roll_channel
-        self.pitch_ch    = pitch_channel
-        self.alt_ch      = alt_channel
-        self.dt          = dt
-        self.v_nominal   = v_nominal
-        self.max_roll_rad  = math.radians(max_roll_deg)
-        self.min_pitch_rad = math.radians(min_pitch_deg)
-        self.max_pitch_rad = math.radians(max_pitch_deg)
-        self.means       = means
-        self.stds        = stds
+        self.w = guidance_scale
+        self.lam = {"roll": lambda_roll, "pitch": lambda_pitch, "bound": lambda_bound}
+        self.r_ch, self.p_ch, self.a_ch = roll_channel, pitch_channel, alt_channel
+        self.dt = dt
+        self.g, self.b, self.sig_c = climb_gain, climb_bias, climb_resid_std
+        self.sig_r2 = roll_d2_std
+        self.max_roll = math.radians(max_roll_deg)
+        self.min_pitch = math.radians(min_pitch_deg)
+        self.max_pitch = math.radians(max_pitch_deg)
+        self.anchor_alt = anchor_alt
+        self.iters = iters
+        self.means = means if means is not None else torch.zeros(3)
+        self.stds = stds if stds is not None else torch.ones(3)
 
-    # ── Compute J(s) ─────────────────────────────────────────────────────────
+        s = self.stds
+        sr, sp, sa = float(s[self.r_ch]), float(s[self.p_ch]), float(s[self.a_ch])
+        # Lipschitz constants of each term's gradient, per normalised channel.
+        # Second difference: ||D2^T D2|| <= 16; first difference: ||D1^T D1|| <= 4.
+        self.L = {
+            "roll":  {self.r_ch: 2 * 16 * (sr / self.sig_r2) ** 2},
+            "pitch": {self.a_ch: 2 * 4 * (sa / (self.dt * self.sig_c)) ** 2,
+                      self.p_ch: 2 * (self.g * sp / self.sig_c) ** 2},
+            "bound": {self.r_ch: 2.0, self.p_ch: 2.0},
+        }
+        if pitch_drives_alt:
+            # Pitch is the cleaner channel: let the coupling term correct only
+            # altitude, otherwise altitude noise is copied into pitch.
+            del self.L["pitch"][self.p_ch]
+
+    # ── Physical-unit view of a normalised tensor ────────────────────────────
+    def _phys(self, x):
+        mean = self.means.to(x.device, x.dtype).view(1, -1, 1)
+        std = self.stds.to(x.device, x.dtype).view(1, -1, 1)
+        return x * std + mean
+
+    # ── Individual cost terms (summed over time, per sample) ────────────────
+    def cost_terms(self, x: torch.Tensor) -> dict:
+        """Return {name: Tensor[B]} cost terms for a normalised batch [B, F, L]."""
+        xp = self._phys(x)
+        roll, pitch, alt = xp[:, self.r_ch], xp[:, self.p_ch], xp[:, self.a_ch]
+
+        d2 = roll[:, 2:] - 2 * roll[:, 1:-1] + roll[:, :-2]
+        J_roll = ((d2 / self.sig_r2) ** 2).sum(-1)
+
+        climb = (alt[:, 1:] - alt[:, :-1]) / self.dt
+        r = (climb - self.g * torch.sin(pitch[:, :-1]) - self.b) / self.sig_c
+        J_pitch = (r ** 2).sum(-1)
+
+        sr = float(self.stds[self.r_ch]); sp = float(self.stds[self.p_ch])
+        relu = torch.nn.functional.relu
+        J_bound = ((relu(roll.abs() - self.max_roll) / sr) ** 2).sum(-1) \
+            + ((relu(self.min_pitch - pitch) / sp) ** 2).sum(-1) \
+            + ((relu(pitch - self.max_pitch) / sp) ** 2).sum(-1)
+        return {"roll": J_roll, "pitch": J_pitch, "bound": J_bound}
+
     def compute_cost(self, x: torch.Tensor) -> torch.Tensor:
-        r"""Compute the kinematic cost :math:`J(\mathbf{s})`.
-
-        Parameters
-        ----------
-        x : Tensor[B, 3, L]
-            Trajectory tensor. ``x[:, 0, :]`` roll, ``x[:, 1, :]`` pitch, ``x[:, 2, :]`` alt.
-
-        Returns
-        -------
-        cost : scalar Tensor
-            Mean kinematic cost across the batch.
-        """
-        if self.means is not None and self.stds is not None:
-            # Denormalise x to physical units before computing cost
-            mean = self.means.to(x.device).view(1, -1, 1)
-            std = self.stds.to(x.device).view(1, -1, 1)
-            x_phys = x * std + mean
-        else:
-            x_phys = x
-            
-        # ── Roll Smoothness cost ─────────────────────────────────────────────
-        roll = x_phys[:, self.roll_ch, :]
-        delta_roll = roll[:, 1:] - roll[:, :-1]
-        # We can approximate d(phi)/dt as delta_roll / dt
-        J_roll = ((delta_roll / self.dt) ** 2).mean()
-
-        # ── Pitch-Altitude Coupling cost ─────────────────────────────────────
-        pitch = x_phys[:, self.pitch_ch, :]
-        alt = x_phys[:, self.alt_ch, :]
-        
-        delta_alt = alt[:, 1:] - alt[:, :-1]
-        pitch_i = pitch[:, :-1]
-        
-        # dZ/dt - V * sin(theta)
-        pitch_err = (delta_alt / self.dt) - self.v_nominal * torch.sin(pitch_i)
-        J_pitch = (pitch_err ** 2).mean()
-
-        # ── Strict Attitude Boundary cost ────────────────────────────────────
-        # Penalise exceeding max_roll, min_pitch, max_pitch
-        roll_bound = torch.nn.functional.relu(torch.abs(roll) - self.max_roll_rad)
-        pitch_min_bound = torch.nn.functional.relu(self.min_pitch_rad - pitch)
-        pitch_max_bound = torch.nn.functional.relu(pitch - self.max_pitch_rad)
-        
-        J_bound = self.lam_r * (roll_bound ** 2).mean() + self.lam_p * (
-            (pitch_min_bound ** 2).mean() + (pitch_max_bound ** 2).mean()
-        )
-
-        # ── Combined cost ────────────────────────────────────────────────────
-        J = self.lam_r * J_roll + self.lam_p * J_pitch + J_bound
-        return J
-
-    # ── Compute gradient ∇J via autograd ─────────────────────────────────────
-    def compute_gradient(self, x_hat: torch.Tensor) -> torch.Tensor:
-        r"""Compute :math:`\nabla_{\hat{\mathbf{x}}_0} J(\hat{\mathbf{x}}_0)`.
-
-        Uses ``torch.autograd.grad`` so that no computational graph is retained
-        after the call.  The input tensor is cloned with ``requires_grad=True``
-        to avoid mutating the diffusion graph.
-
-        Parameters
-        ----------
-        x_hat : Tensor[B, F, L]
-            Predicted clean trajectory (detached from the main graph).
-
-        Returns
-        -------
-        grad : Tensor[B, F, L]  (detached)
-        """
-        with torch.enable_grad():
-            x = x_hat.detach().requires_grad_(True)
-            cost = self.compute_cost(x)
-            (grad,) = torch.autograd.grad(cost, x)
-        return grad.detach()
+        """Weighted total cost per sample, Tensor[B]."""
+        terms = self.cost_terms(x)
+        return sum(self.lam[k] * v for k, v in terms.items())
 
     # ── Apply guidance to a predicted x_0 ────────────────────────────────────
-    def apply(self, x0_pred: torch.Tensor) -> torch.Tensor:
-        r"""Return the kinematic-guided :math:`\hat{\mathbf{x}}_0`.
-
-        .. math::
-
-            \hat{\mathbf{x}}_0^{\text{guided}}
-                = \hat{\mathbf{x}}_0 - w \cdot \nabla_{\hat{\mathbf{x}}_0} J
-
-        Parameters
-        ----------
-        x0_pred : Tensor[B, F, L] — predicted clean trajectory
-
-        Returns
-        -------
-        x0_guided : Tensor[B, F, L]
-        """
-        grad = self.compute_gradient(x0_pred)
-        # Clip gradient to prevent massive jumps when physical cost is large
-        grad = grad.clamp(-1.0, 1.0)
-        return x0_pred - self.w * grad
+    def apply(self, x0_pred: torch.Tensor, alpha_bar: float = 1.0) -> torch.Tensor:
+        """Return the guided x̂_0 (normalised, [B, F, L])."""
+        x = x0_pred
+        w_t = self.w * float(alpha_bar)
+        if w_t > 0:
+            for _ in range(self.iters):
+                step = torch.zeros_like(x)
+                with torch.enable_grad():
+                    xg = x.detach().requires_grad_(True)
+                    terms = self.cost_terms(xg)
+                    for name, J in terms.items():
+                        if self.lam[name] == 0:
+                            continue
+                        (g,) = torch.autograd.grad(J.sum(), xg, retain_graph=True)
+                        for c, Lc in self.L[name].items():
+                            step[:, c] += self.lam[name] * g[:, c] / Lc
+                x = (x - w_t * step).detach()
+        if self.anchor_alt:
+            # physical alt[0] -> 0  <=>  normalised alt[0] -> -mean/std
+            a0 = -float(self.means[self.a_ch]) / float(self.stds[self.a_ch])
+            x = x.clone()
+            x[:, self.a_ch] -= x[:, self.a_ch, :1] - a0
+        return x

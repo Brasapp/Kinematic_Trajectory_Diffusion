@@ -79,9 +79,9 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from src.data_parser import parse_directory_from_config, TrajectoryDataset
+from src.data_parser import load_split, select_features, TrajectoryDataset
 from src.diffusion_math import CosineNoiseScheduler, KinematicGuidance
-from src.unet_1d import UNet1D
+from src.unet_1d import build_model, core_module
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -167,7 +167,7 @@ def ddim_sample(
 
         # ── Step 3: Apply kinematic guidance to x̂_0 ─────────────────────
         # x̂_0^guided = x̂_0 - w * ∇_{x̂_0} J(x̂_0)
-        x0_pred = guidance.apply(x0_pred)             # [B, F, L]
+        x0_pred = guidance.apply(x0_pred, alpha_bar=ab_t)  # [B, F, L]
 
         # ── Step 4: DDIM update ───────────────────────────────────────────
         ab_prev = scheduler.alpha_bars[t_prev]        # scalar
@@ -197,8 +197,8 @@ def ddim_sample(
 # MAIN SAMPLING FUNCTION
 # ──────────────────────────────────────────────────────────────────────────────
 
-def reconstruct_trajectory(roll: np.ndarray, pitch: np.ndarray, alt: np.ndarray, 
-                           v_nominal: float, dt: float) -> np.ndarray:
+def reconstruct_trajectory(roll: np.ndarray, pitch: np.ndarray, alt: np.ndarray,
+                           v_nominal: float, dt: float, max_bank_deg: float = 85.0) -> np.ndarray:
     """
     Reconstruct full trajectory using forward integration (dead-reckoning).
     
@@ -217,13 +217,118 @@ def reconstruct_trajectory(roll: np.ndarray, pitch: np.ndarray, alt: np.ndarray,
     E = np.zeros(L)
     yaw = np.zeros(L)
     g = 9.81
-    
+    max_bank = np.radians(max_bank_deg)
+
     for i in range(L - 1):
-        yaw[i+1] = yaw[i] + (g * np.tan(roll[i]) / v_nominal) * dt
+        # Coordinated turn. Bank is capped for the turn rate: tan() explodes near
+        # 90 deg, while the real aircraft tops out around 100-130 deg/s.
+        bank = np.clip(roll[i], -max_bank, max_bank)
+        yaw[i+1] = yaw[i] + (g * np.tan(bank) / v_nominal) * dt
         N[i+1] = N[i] + v_nominal * np.cos(yaw[i]) * dt
         E[i+1] = E[i] + v_nominal * np.sin(yaw[i]) * dt
         
     return np.stack([N, E, alt, yaw, roll, pitch], axis=1)
+
+def calibrate_guidance(dataset, alt_ch: int = 2, pitch_ch: int = 1, roll_ch: int = 0) -> dict:
+    """Fit the guidance constants on the real (training) windows.
+
+    Returns climb_gain g and climb_bias b of  climb ≈ g·sin(pitch) + b
+    (least squares), the residual RMS of that fit, and the RMS of the roll
+    second difference.
+    """
+    x = dataset.denormalise(dataset.data).numpy()        # [N, F, L] physical
+    dt = dataset.mean_dt_s
+    climb = np.diff(x[:, alt_ch], axis=1) / dt
+    sp = np.sin(x[:, pitch_ch, :-1])
+    A = np.stack([sp.ravel(), np.ones(sp.size)], 1)
+    (g, b), *_ = np.linalg.lstsq(A, climb.ravel(), rcond=None)
+    resid = climb - (g * sp + b)
+    d2 = np.diff(x[:, roll_ch], 2, axis=1)
+    return {
+        "climb_gain": float(g),
+        "climb_bias": float(b),
+        "climb_resid_std": float(np.sqrt((resid ** 2).mean())),
+        "roll_d2_std": float(np.sqrt((d2 ** 2).mean())),
+    }
+
+
+def build_guidance(config: dict, stats: dict, calibration: dict) -> KinematicGuidance:
+    """Create the KinematicGuidance object from config, normalisation stats
+    (``TrajectoryDataset.stats``) and ``calibrate_guidance`` output."""
+    d = config["diffusion"]
+    cal = calibration
+    logger.info(
+        "Guidance calibration: climb = %.1f*sin(pitch) %+.2f m/s (resid %.2f m/s), "
+        "roll d2 rms %.2f deg" % (cal["climb_gain"], cal["climb_bias"],
+                                  cal["climb_resid_std"], np.degrees(cal["roll_d2_std"])))
+    return KinematicGuidance(
+        guidance_scale=d.get("guidance_scale", 0.0),
+        lambda_roll=d.get("lambda_roll", 1.0),
+        lambda_pitch=d.get("lambda_pitch", 1.0),
+        lambda_bound=d.get("lambda_bound", 1.0),
+        roll_channel=0, pitch_channel=1, alt_channel=2,
+        dt=stats["mean_dt_s"],
+        max_roll_deg=d.get("max_roll_deg", 90.0),
+        min_pitch_deg=d.get("min_pitch_deg", -20.0),
+        max_pitch_deg=d.get("max_pitch_deg", 40.0),
+        anchor_alt=d.get("anchor_alt", True),
+        pitch_drives_alt=d.get("pitch_drives_alt", True),
+        iters=d.get("guidance_iters", 1),
+        means=torch.tensor(stats["mean"], dtype=torch.float32),
+        stds=torch.tensor(stats["std"], dtype=torch.float32),
+        **cal,
+    )
+
+
+def load_checkpoint_for_sampling(config: dict, checkpoint_path: str, device) -> tuple:
+    """Load model + the metadata stored at training time.
+
+    Returns (model, stats, calibration, mean_speed_ms).  Checkpoints from before
+    metadata was stored fall back to re-parsing the training logs.
+    """
+    model = build_model(config).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    core_module(model).load_state_dict(ckpt["model"])
+    model.eval()
+    logger.info(f"Loaded checkpoint: {checkpoint_path}  (epoch {ckpt['epoch']+1}, "
+                f"{type(model).__name__})")
+    if "norm" in ckpt:
+        return model, ckpt["norm"], ckpt["guidance_calibration"], ckpt["mean_speed_ms"]
+    logger.warning("Checkpoint has no stored statistics; re-parsing the training logs.")
+    split = load_split(config)
+    ds = TrajectoryDataset.from_config(
+        select_features(split["train"], split["feat_idx"]), config["data"], split["dt_s"])
+    return model, ds.stats, calibrate_guidance(ds), split["mean_speed_ms"]
+
+
+def denormalise(x: torch.Tensor, stats: dict) -> torch.Tensor:
+    """Normalised [B, F, L] -> physical units."""
+    mean = torch.tensor(stats["mean"], device=x.device, dtype=x.dtype).view(1, -1, 1)
+    std = torch.tensor(stats["std"], device=x.device, dtype=x.dtype).view(1, -1, 1)
+    return x * std + mean
+
+
+def generate(config: dict, model, stats: dict, calibration: dict, device,
+             num_samples: int = None, seed: int = None) -> np.ndarray:
+    """Run guided DDIM and return physical [B, F, L] (roll, pitch, alt)."""
+    scheduler = CosineNoiseScheduler(
+        T=config["diffusion"]["T"], s=config["diffusion"]["s"], device=str(device))
+    guidance = build_guidance(config, stats, calibration)
+    seed = config["sampling"].get("seed") if seed is None else seed
+    if seed is not None:
+        torch.manual_seed(seed)
+    with torch.no_grad():
+        x_norm = ddim_sample(
+            model, scheduler, guidance,
+            num_samples=num_samples or config["sampling"]["num_samples"],
+            seq_len=config["data"]["sequence_length"],
+            features=config["data"]["features"],
+            ddim_steps=config["sampling"]["ddim_steps"],
+            eta=config["sampling"]["eta"],
+            device=device,
+        )
+    return denormalise(x_norm, stats).cpu().numpy()
+
 
 def sample(config: dict, checkpoint_path: str):
     """Load a trained model and generate synthetic UAV trajectories.
@@ -236,60 +341,9 @@ def sample(config: dict, checkpoint_path: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    # ── Rebuild dataset statistics for denormalisation ────────────────────────
-    logger.info("Loading dataset to recover normalisation statistics …")
-    trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
-    dataset = TrajectoryDataset.from_config(trajectories, config["data"], mean_dt_s)
-
-    # ── Instantiate model ─────────────────────────────────────────────────────
-    model = UNet1D(
-        in_channels=config["model"]["in_channels"],
-        base_channels=config["model"]["base_channels"],
-        depth=config["model"]["depth"],
-        time_emb_dim=config["model"]["time_emb_dim"],
-    ).to(device)
-
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    logger.info(f"Loaded checkpoint: {checkpoint_path}  (epoch {ckpt['epoch']+1})")
-
-    # ── Noise scheduler ───────────────────────────────────────────────────────
-    scheduler = CosineNoiseScheduler(
-        T=config["diffusion"]["T"],
-        s=config["diffusion"]["s"],
-        device=str(device),
-    )
-
-    # ── Kinematic guidance ────────────────────────────────────────────────────
-    guidance = KinematicGuidance(
-        guidance_scale=config["diffusion"]["guidance_scale"],
-        lambda_roll=config["diffusion"]["lambda_roll"],
-        lambda_pitch=config["diffusion"]["lambda_pitch"],
-        roll_channel=0,
-        pitch_channel=1,
-        alt_channel=2,
-        dt=dataset.mean_dt_s,
-        v_nominal=mean_speed_ms,
-        means=torch.tensor(dataset.mean, dtype=torch.float32),
-        stds=torch.tensor(dataset.std, dtype=torch.float32),
-    )
-
-    # ── DDIM sampling ─────────────────────────────────────────────────────────
-    x_norm = ddim_sample(
-        model,
-        scheduler,
-        guidance,
-        num_samples=config["sampling"]["num_samples"],
-        seq_len=config["data"]["sequence_length"],
-        features=config["data"]["features"],
-        ddim_steps=config["sampling"]["ddim_steps"],
-        eta=config["sampling"]["eta"],
-        device=device,
-    )  # [B, 9, L]  — normalised
-
-    # ── Denormalise ───────────────────────────────────────────────────────────
-    x_phys = dataset.denormalise(x_norm)  # [B, 3, L]  — physical units
+    model, stats, calibration, mean_speed_ms = load_checkpoint_for_sampling(
+        config, checkpoint_path, device)
+    x_phys = generate(config, model, stats, calibration, device)   # [B, 3, L]
 
     # ── Export to CSV ─────────────────────────────────────────────────────────
     output_path = Path(config["sampling"]["output_csv"])
@@ -298,13 +352,8 @@ def sample(config: dict, checkpoint_path: str):
     B, F, L = x_phys.shape
     rows = []
     for sample_idx in range(B):
-        # x_phys[sample_idx] is [3, L] -> roll, pitch, alt
-        roll = x_phys[sample_idx, 0].cpu().numpy()
-        pitch = x_phys[sample_idx, 1].cpu().numpy()
-        alt = x_phys[sample_idx, 2].cpu().numpy()
-        
-        traj_6d = reconstruct_trajectory(roll, pitch, alt, mean_speed_ms, dataset.mean_dt_s)
-        
+        roll, pitch, alt = x_phys[sample_idx]
+        traj_6d = reconstruct_trajectory(roll, pitch, alt, mean_speed_ms, stats["mean_dt_s"])
         for step_idx, features_row in enumerate(traj_6d):
             row = {"sample_id": sample_idx, "step": step_idx}
             for feat_name, val in zip(FEATURE_NAMES, features_row):

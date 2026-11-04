@@ -1,71 +1,58 @@
 """
 evaluate.py
 ===========
-Quantitative and visual evaluation of the Kinematic-Guided Trajectory
-Diffusion Model.
+Compare generated trajectories with real AUTO flight.
 
-Three evaluation pillars
-------------------------
+Real data
+---------
+The logs are split by file exactly as in training (``data_parser.load_split``):
 
-1. Kinematic Metrics  (physics-based, per-trajectory)
-   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-   - **Mean Yaw Rate** :math:`\\bar{|\\Delta\\psi|}` — average absolute turn rate per step (rad/step).
-     Lower = smoother turns.
-   - **Max Yaw Rate** :math:`\\max|\\Delta\\psi|` — worst-case single-step heading change.
-   - **Mean Speed** :math:`\\bar{\\|\\mathbf{v}\\|_2}` — average 3D flight speed (m/s).
-   - **Velocity Smoothness** :math:`\\bar{\\|\\Delta\\mathbf{v}\\|_2}` — average step-to-step speed
-     change (acceleration proxy, m/s per step).
-   - **Kinematic Cost** :math:`J(s) = \\sum(\\Delta\\psi)^2 + \\lambda\\sum\\|\\Delta\\mathbf{v}\\|^2`
-     — the exact cost minimised by guidance.  Lower = better.
+- **real-train** — windows from the logs the model was trained on
+- **real-val**   — windows from held-out logs the model never saw
 
-2. Distribution Metrics  (real vs generated)
-   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-   **Maximum Mean Discrepancy (MMD)** with an RBF kernel:
+The real flight paths are the **GPS/EKF positions** from the logs (N, E, ground
+course), shifted to start at the origin and rotated so the initial course is
+north, the same frame as the generated paths.  Generated paths are rebuilt
+from generated roll by dead reckoning (``sample.reconstruct_trajectory``); the
+"dead-reckoning check" applies the same reconstruction to real roll and
+measures how far it ends up from the real GPS path, i.e. how much the
+generated paths can be trusted.
 
-   .. math::
+With ``data.mirror_roll`` the model generates a left/right symmetric
+distribution, so the real sets are compared together with their mirror image.
 
-       \\text{MMD}^2(P, Q)
-           = \\mathbb{E}_{x,x' \\sim P}[k(x,x')]
-           - 2\\,\\mathbb{E}_{x \\sim P,\\, y \\sim Q}[k(x,y)]
-           + \\mathbb{E}_{y,y' \\sim Q}[k(y,y')]
-
-   where :math:`k(x,y) = \\exp\\!\\left(-\\|x-y\\|^2 / (2\\sigma^2)\\right)`.
-
-   MMD ≈ 0 means the two distributions are statistically indistinguishable.
-   MMD >> 0 means the generated distribution is systematically different.
-
-   Per-trajectory summary statistics (mean + std of each feature channel)
-   are used as the feature vector so that the metric is tractable.
-
-3. Visual Outputs  (saved to outputs/)
-   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-   - **3D trajectory plot** — real (blue) vs generated (orange) flight paths
-   - **Feature histograms** — per-channel distribution comparison
-   - **Loss curve** — train vs val loss from ``checkpoints/loss_history.csv``
-   - **Yaw time-series** — real vs generated yaw angle over time
+Metrics
+-------
+- Attitude/altitude statistics (ranges, step sizes, left-turn share)
+- Turn rate and heading change over the window
+- Pitch-climb residual (the guidance coupling term)
+- MMD² on per-window summary features, with **real-train vs real-val** as the
+  reference: a generated MMD near that value is as close as two real sets are
+- Memorisation check: nearest-neighbour distance of each generated window to
+  the training windows, compared with the same distance for real-val windows
 
 Usage
 -----
-    python -m src.evaluate \\
-        --config configs/default.yaml \\
-        --generated outputs/generated_trajectories.csv
+    python -m src.evaluate --config configs/default.yaml \\
+        [--generated outputs_v6/generated_trajectories.csv] \\
+        [--checkpoint checkpoints_v6/epoch_0800.pt]
 """
 
 import argparse
+import json
 import logging
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend — works without a display
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 import numpy as np
 import pandas as pd
 import torch
 import yaml
 
-from src.data_parser import parse_directory_from_config, TrajectoryDataset
-from src.diffusion_math import KinematicGuidance
+from src.data_parser import COL, load_split, select_features, TrajectoryDataset
+from src.sample import calibrate_guidance, reconstruct_trajectory
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -74,419 +61,385 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-FEATURE_NAMES = ["N_m", "E_m", "alt_m", "yaw_rad", "roll_rad", "pitch_rad"]
-FEATURE_LABELS = ["N (m)", "E (m)", "Alt (m)", "Yaw (rad)", "Roll (rad)", "Pitch (rad)"]
+D = np.degrees
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1.  KINEMATIC METRICS
+# 1.  WINDOW SETS
+# ──────────────────────────────────────────────────────────────────────────────
+# A "set" is a dict of arrays [N, L]: N, E, alt, course, roll, pitch.
+
+def real_windows(segments, seq_len: int, stride: int) -> dict:
+    """Cut real full-column segments into windows in the generated frame."""
+    out = {k: [] for k in ("N", "E", "alt", "course", "roll", "pitch", "speed")}
+    for s in segments:
+        for a in range(0, len(s) - seq_len + 1, stride):
+            w = s[a:a + seq_len]
+            course = np.unwrap(np.arctan2(w[:, COL["vE"]], w[:, COL["vN"]]))
+            c0 = course[0]
+            n = w[:, COL["N"]] - w[0, COL["N"]]
+            e = w[:, COL["E"]] - w[0, COL["E"]]
+            # rotate so the initial course points north (+N)
+            out["N"].append(np.cos(c0) * n + np.sin(c0) * e)
+            out["E"].append(-np.sin(c0) * n + np.cos(c0) * e)
+            out["alt"].append(w[:, COL["alt"]] - w[0, COL["alt"]])
+            out["course"].append(course - c0)
+            out["roll"].append(w[:, COL["roll"]])
+            out["pitch"].append(w[:, COL["pitch"]])
+            out["speed"].append(np.hypot(w[:, COL["vN"]], w[:, COL["vE"]]))
+    return {k: np.asarray(v, dtype=np.float64) for k, v in out.items()}
+
+
+def mirror(d: dict) -> dict:
+    """Left/right mirror image of a window set."""
+    m = dict(d)
+    for k in ("E", "course", "roll"):
+        m[k] = -d[k]
+    return m
+
+
+def concat(*sets) -> dict:
+    return {k: np.concatenate([s[k] for s in sets]) for k in sets[0] if k in sets[-1]}
+
+
+def dead_reckon(d: dict, speed: float, dt: float) -> dict:
+    """Rebuild N/E/course from roll exactly as generated paths are built."""
+    out = {k: d[k] for k in ("alt", "roll", "pitch")}
+    rec = np.stack([reconstruct_trajectory(r, p, a, speed, dt)
+                    for r, p, a in zip(d["roll"], d["pitch"], d["alt"])])
+    out["N"], out["E"], out["course"] = rec[:, :, 0], rec[:, :, 1], rec[:, :, 3]
+    return out
+
+
+def load_generated(csv_path: str, seq_len: int) -> dict:
+    df = pd.read_csv(csv_path).sort_values(["sample_id", "step"])
+    n = df["sample_id"].nunique()
+    col = lambda c: df[c].to_numpy(np.float64).reshape(n, -1)[:, :seq_len]
+    return {"N": col("N_m"), "E": col("E_m"), "alt": col("alt_m"),
+            "course": col("yaw_rad"), "roll": col("roll_rad"), "pitch": col("pitch_rad")}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  METRICS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def kinematic_metrics(trajs: np.ndarray, diff_cfg: dict, mean_dt_s: float) -> dict:
-    r"""Compute per-trajectory kinematic statistics and return their means.
+METRICS = [
+    # key, label, unit
+    ("roll_std", "Roll std", "deg"),
+    ("roll_abs_med", "Roll |median|", "deg"),
+    ("roll_p99", "Roll |p99|", "deg"),
+    ("bank80_pct", "Time at |roll| > 80 deg", "%"),
+    ("roll_step_med", "Roll step median", "deg"),
+    ("roll_step_p99", "Roll step p99", "deg"),
+    ("left_pct", "Left-turn windows", "%"),
+    ("pitch_mean", "Pitch mean", "deg"),
+    ("pitch_std", "Pitch std", "deg"),
+    ("pitch_step_med", "Pitch step median", "deg"),
+    ("alt_std", "Alt change std", "m"),
+    ("alt_end_std", "Alt change at end, std", "m"),
+    ("alt_step_p99", "Alt step p99", "m"),
+    ("climb_resid", "Pitch-climb residual RMS", "m/s"),
+    ("turn_med", "Turn rate |median|", "deg/s"),
+    ("turn_p99", "Turn rate |p99|", "deg/s"),
+    ("heading_change_med", "Heading change / window", "deg"),
+]
 
-    Parameters
-    ----------
-    trajs      : ndarray[N, 9, L]  — trajectories in physical units, channel-first
-    diff_cfg   : dict              — diffusion config containing lambda weights
-    mean_dt_s  : float             — mean timestep for coordinated turn constraint
 
-    Returns
-    -------
-    dict with keys:
-        mean_yaw_rate, max_yaw_rate, mean_speed,
-        velocity_smoothness, kinematic_cost
-    """
-    N_m, E_m, alt_m, yaw_rad, roll_rad, pitch_rad = 0, 1, 2, 3, 4, 5
-
-    yaw = trajs[:, yaw_rad, :]
-    delta_yaw = np.abs(yaw[:, 1:] - yaw[:, :-1])
-    
-    mean_yaw_rate = np.mean(delta_yaw)
-    max_yaw_rate  = np.max(delta_yaw)
-
-    speed = np.zeros_like(yaw[:, :-1])
-    speed.fill(15.0)  # Approximate velocity since we're generating fixed speed paths
-    mean_speed = 15.0
-    
-    # We don't have explicit velocity in the state space anymore, just approximate it.
-    velocity_smoothness = 0.0
-
-    kinematic_cost = 0.0  # Optional: implement the same cost function mathematically here
-
+def window_metrics(d: dict, dt: float, cal: dict) -> dict:
+    roll, pitch, alt, course = d["roll"], d["pitch"], d["alt"], d["course"]
+    dr = np.abs(np.diff(roll, axis=1))
+    turn = np.abs(np.diff(course, axis=1)) / dt
+    climb = np.diff(alt, axis=1) / dt
+    resid = climb - (cal["climb_gain"] * np.sin(pitch[:, :-1]) + cal["climb_bias"])
     return {
-        "mean_yaw_rate_rad":   float(mean_yaw_rate),
-        "max_yaw_rate_rad":    float(max_yaw_rate),
-        "mean_speed_ms":       float(mean_speed),
-        "velocity_smoothness": float(velocity_smoothness),
-        "kinematic_cost_J":    float(kinematic_cost),
+        "roll_std": D(roll.std()),
+        "roll_abs_med": D(np.median(np.abs(roll))),
+        "roll_p99": D(np.percentile(np.abs(roll), 99)),
+        "bank80_pct": 100.0 * (np.abs(roll) > np.radians(80)).mean(),
+        "roll_step_med": D(np.median(dr)),
+        "roll_step_p99": D(np.percentile(dr, 99)),
+        "left_pct": 100.0 * (roll.mean(1) < 0).mean(),
+        "pitch_mean": D(pitch.mean()),
+        "pitch_std": D(pitch.std()),
+        "pitch_step_med": D(np.median(np.abs(np.diff(pitch, axis=1)))),
+        "alt_std": alt.std(),
+        "alt_end_std": alt[:, -1].std(),
+        "alt_step_p99": np.percentile(np.abs(np.diff(alt, axis=1)), 99),
+        "climb_resid": float(np.sqrt((resid ** 2).mean())),
+        "turn_med": D(np.median(turn)),
+        "turn_p99": D(np.percentile(turn, 99)),
+        "heading_change_med": D(np.median(np.abs(course[:, -1]))),
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2.  DISTRIBUTION METRIC: MMD
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _rbf_kernel(X: np.ndarray, Y: np.ndarray, sigma: float) -> np.ndarray:
-    r"""Compute the RBF kernel matrix between rows of X and Y.
-
-    .. math::
-
-        K_{ij} = \exp\!\left(-\frac{\|X_i - Y_j\|^2}{2\sigma^2}\right)
-
-    Parameters
-    ----------
-    X : ndarray[n, d]
-    Y : ndarray[m, d]
-    sigma : float — bandwidth
-
-    Returns
-    -------
-    K : ndarray[n, m]
-    """
-    # ||X_i - Y_j||² via broadcasting
-    diff = X[:, None, :] - Y[None, :, :]      # [n, m, d]
-    sq   = (diff ** 2).sum(axis=-1)            # [n, m]
-    return np.exp(-sq / (2.0 * sigma ** 2))
+def summary_features(d: dict, dt: float) -> np.ndarray:
+    """Per-window summary vector used for MMD (sign-invariant where needed)."""
+    roll, pitch, alt, course = d["roll"], d["pitch"], d["alt"], d["course"]
+    return np.stack([
+        roll.mean(1), roll.std(1), np.abs(np.diff(roll, axis=1)).mean(1),
+        pitch.mean(1), pitch.std(1), np.abs(np.diff(pitch, axis=1)).mean(1),
+        alt[:, -1], alt.std(1), np.abs(np.diff(alt, axis=1)).mean(1),
+        course[:, -1], (np.abs(np.diff(course, axis=1)) / dt).mean(1),
+    ], 1)
 
 
-def compute_mmd(real: np.ndarray, generated: np.ndarray,
-                sigma: float = None) -> float:
-    r"""Compute the squared Maximum Mean Discrepancy (MMD²) with an RBF kernel.
-
-    .. math::
-
-        \text{MMD}^2(P, Q)
-            = \mathbb{E}[k(x,x')]
-            - 2\,\mathbb{E}[k(x,y)]
-            + \mathbb{E}[k(y,y')]
-
-    where :math:`x, x' \sim P` (real) and :math:`y, y' \sim Q` (generated).
-
-    Feature representation: per-trajectory (mean, std) of each channel →
-    concatenated to a 12-dim vector per trajectory (6 features).
-
-    Parameters
-    ----------
-    real      : ndarray[N_r, 6, L]
-    generated : ndarray[N_g, 6, L]
-    sigma     : RBF bandwidth; if None, uses the median heuristic
-
-    Returns
-    -------
-    mmd2 : float  (MMD², non-negative; 0 = identical distributions)
-    """
-    def featurise(trajs):
-        # Per-trajectory (mean, std) across the time axis → [N, 6*2=12]
-        mu  = trajs.mean(axis=-1)   # [N, 6]
-        std = trajs.std(axis=-1)    # [N, 6]
-        return np.concatenate([mu, std], axis=-1)   # [N, 12]
-
-    X = featurise(real).astype(np.float64)       # [N_r, 12]
-    Y = featurise(generated).astype(np.float64)  # [N_g, 12]
-
-    # Median heuristic for sigma
-    if sigma is None:
-        all_pts = np.concatenate([X, Y], axis=0)
-        diff    = all_pts[:, None, :] - all_pts[None, :, :]
-        sq      = (diff ** 2).sum(axis=-1)
-        sigma   = np.sqrt(np.median(sq) / 2.0 + 1e-8)
-
-    Kxx = _rbf_kernel(X, X, sigma)
-    Kyy = _rbf_kernel(Y, Y, sigma)
-    Kxy = _rbf_kernel(X, Y, sigma)
-
+def mmd2(X: np.ndarray, Y: np.ndarray, sigma: float) -> float:
+    """Unbiased squared MMD with an RBF kernel of bandwidth ``sigma``."""
+    def k(A, B):
+        sq = ((A[:, None, :] - B[None, :, :]) ** 2).sum(-1)
+        return np.exp(-sq / (2 * sigma ** 2))
+    Kxx, Kyy, Kxy = k(X, X), k(Y, Y), k(X, Y)
     n, m = len(X), len(Y)
-
-    # Unbiased estimator: zero diagonal for same-sample terms
     np.fill_diagonal(Kxx, 0.0)
     np.fill_diagonal(Kyy, 0.0)
+    return float(Kxx.sum() / (n * (n - 1)) + Kyy.sum() / (m * (m - 1)) - 2 * Kxy.mean())
 
-    mmd2 = (Kxx.sum() / (n * (n - 1))
-            - 2.0 * Kxy.mean()
-            + Kyy.sum() / (m * (m - 1)))
 
-    return float(mmd2)
+def nn_distance(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """For every row of A, the Euclidean distance to its nearest row of B."""
+    a2 = (A ** 2).sum(1)[:, None]
+    b2 = (B ** 2).sum(1)[None, :]
+    return np.sqrt(np.maximum(a2 + b2 - 2 * A @ B.T, 0.0)).min(1)
+
+
+def raw_vectors(d: dict, stats: dict) -> np.ndarray:
+    """Flattened normalised (roll, pitch, alt) windows."""
+    x = np.stack([d["roll"], d["pitch"], d["alt"]], 1)
+    mean = np.asarray(stats["mean"])[None, :, None]
+    std = np.asarray(stats["std"])[None, :, None]
+    return ((x - mean) / std).reshape(len(x), -1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3.  VISUALISATIONS
+# 3.  PLOTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def plot_3d_trajectories(real: np.ndarray, generated: np.ndarray,
-                         out_path: Path, n_show: int = 5):
-    """3D NED scatter plot: real (blue) vs generated (orange) trajectories."""
-    fig = plt.figure(figsize=(12, 8))
-    ax  = fig.add_subplot(111, projection="3d")
-
-    n_real = min(n_show, len(real))
-    n_gen  = min(n_show, len(generated))
-
-    for i in range(n_real):
-        N, E, D = real[i, 0, :], real[i, 1, :], real[i, 2, :]
-        ax.plot(E, N, -D, alpha=0.7, linewidth=1.5,
-                color=cm.Blues(0.4 + 0.5 * i / n_real),
-                label="Real" if i == 0 else None)
-
-    for i in range(n_gen):
-        N, E, D = generated[i, 0, :], generated[i, 1, :], generated[i, 2, :]
-        ax.plot(E, N, -D, alpha=0.7, linewidth=1.5, linestyle="--",
-                color=cm.Oranges(0.4 + 0.5 * i / n_gen),
-                label="Generated" if i == 0 else None)
-
-    ax.set_title("3D Trajectories")
-    ax.set_xlabel("East (m)")
-    ax.set_ylabel("North (m)")
-    ax.set_zlabel("Altitude (m)")
-    ax.legend()
+def plot_paths(real: dict, gen: dict, out_path: Path, n_show: int = 12, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    for ax, d, title, color in ((axes[0], real, "Real (GPS, held-out logs)", "tab:blue"),
+                                (axes[1], gen, "Generated (dead-reckoned)", "tab:orange")):
+        for i in rng.choice(len(d["N"]), min(n_show, len(d["N"])), replace=False):
+            ax.plot(d["E"][i], d["N"][i], color=color, alpha=0.7, lw=1.2)
+        ax.plot(0, 0, "k.", ms=8)
+        ax.set_title(title)
+        ax.set_xlabel("East (m)")
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect("equal", adjustable="datalim")
+    axes[0].set_ylabel("North (m), initial course = north")
+    fig.suptitle("Top-down paths, 12.8 s windows")
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
-    logger.info(f"Saved 3D plot → {out_path}")
 
 
-def plot_2d_trajectories(real: np.ndarray, generated: np.ndarray,
-                         out_path: Path, n_show: int = 5):
-    """2D top-down scatter plot: East vs North."""
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    n_real = min(n_show, len(real))
-    n_gen  = min(n_show, len(generated))
-
-    for i in range(n_real):
-        N, E = real[i, 0, :], real[i, 1, :]
-        ax.plot(E, N, alpha=0.7, linewidth=1.5,
-                color=cm.Blues(0.4 + 0.5 * i / n_real),
-                label="Real" if i == 0 else None)
-
-    for i in range(n_gen):
-        N, E = generated[i, 0, :], generated[i, 1, :]
-        ax.plot(E, N, alpha=0.7, linewidth=1.5, linestyle="--",
-                color=cm.Oranges(0.4 + 0.5 * i / n_gen),
-                label="Generated" if i == 0 else None)
-
-    ax.set_title("2D Top-Down Trajectories")
+def plot_dead_reckoning(real: dict, rec: dict, out_path: Path, n_show: int = 6):
+    fig, ax = plt.subplots(figsize=(8, 7))
+    idx = np.linspace(0, len(real["N"]) - 1, n_show).astype(int)
+    for j, i in enumerate(idx):
+        c = plt.cm.tab10(j)
+        ax.plot(real["E"][i], real["N"][i], color=c, lw=1.5, label="GPS" if j == 0 else None)
+        ax.plot(rec["E"][i], rec["N"][i], color=c, lw=1.2, ls="--",
+                label="Rebuilt from roll" if j == 0 else None)
+    ax.plot(0, 0, "k.", ms=8)
+    ax.set_title("Dead-reckoning check (held-out logs)")
     ax.set_xlabel("East (m)")
     ax.set_ylabel("North (m)")
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.axis("equal")  # Equal aspect ratio for spatial realism
+    ax.set_aspect("equal", adjustable="datalim")
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
-    logger.info(f"Saved 2D plot → {out_path}")
 
 
-def plot_feature_histograms(real: np.ndarray, generated: np.ndarray,
-                            out_path: Path):
-    """Per-feature histogram comparing real and generated distributions."""
-    n_feats = real.shape[1]
-    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
-    axes = axes.flatten()
-
-    for i in range(n_feats):
-        ax  = axes[i]
-        r_v = real[:, i, :].flatten()
-        g_v = generated[:, i, :].flatten()
-
-        # Clip to 1st–99th percentile of real data for readable axes
-        lo, hi = np.percentile(r_v, 1), np.percentile(r_v, 99)
-        bins   = np.linspace(lo, hi, 60)
-
-        ax.hist(r_v, bins=bins, alpha=0.6, density=True,
-                color="#1f77b4", label="Real")
-        ax.hist(g_v, bins=bins, alpha=0.6, density=True,
-                color="#ff7f0e", label="Generated")
-        ax.set_title(FEATURE_LABELS[i])
-        ax.legend(fontsize=8)
-        ax.set_xlabel("Value")
-        ax.set_ylabel("Density")
-
-    fig.suptitle("Feature Distribution: Real vs Generated", fontsize=14)
+def plot_histograms(real: dict, gen: dict, dt: float, out_path: Path):
+    panels = [
+        ("Roll (deg)", D(real["roll"]), D(gen["roll"])),
+        ("Pitch (deg)", D(real["pitch"]), D(gen["pitch"])),
+        ("Alt change since window start (m)", real["alt"], gen["alt"]),
+        ("Roll step (deg)", D(np.diff(real["roll"], axis=1)), D(np.diff(gen["roll"], axis=1))),
+        ("Turn rate (deg/s)", D(np.diff(real["course"], axis=1)) / dt, D(np.diff(gen["course"], axis=1)) / dt),
+        ("Heading change per window (deg)", D(real["course"][:, -1]), D(gen["course"][:, -1])),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    for ax, (title, r, g) in zip(axes.flat, panels):
+        r, g = np.ravel(r), np.ravel(g)
+        lo, hi = np.percentile(np.concatenate([r, g]), [0.5, 99.5])
+        bins = np.linspace(lo, hi, 60)
+        ax.hist(r, bins=bins, density=True, alpha=0.55, color="tab:blue", label="Real (all logs, mirrored)")
+        ax.hist(g, bins=bins, density=True, alpha=0.55, color="tab:orange", label="Generated")
+        ax.set_title(title)
+    axes[0, 0].legend(fontsize=8)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
-    logger.info(f"Saved histogram plot → {out_path}")
 
 
 def plot_loss_curve(loss_csv: Path, out_path: Path):
-    """Plot train vs val loss from the training log CSV."""
     if not loss_csv.exists():
         logger.warning(f"Loss CSV not found: {loss_csv} — skipping loss plot.")
         return
-
     df = pd.read_csv(loss_csv)
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(df["epoch"], df["train_loss"], label="Train loss", color="#1f77b4")
-    ax.plot(df["epoch"], df["val_loss"],   label="Val loss",   color="#ff7f0e",
-            linestyle="--")
+    ax.plot(df["epoch"], df["train_loss"], label="Train loss")
+    ax.plot(df["epoch"], df["val_loss"], label="Val loss (held-out logs)", ls="--")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("MSE Loss")
-    ax.set_title("Training Convergence")
-    ax.legend()
+    ax.set_ylabel("Loss")
     ax.set_yscale("log")
+    ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
-    logger.info(f"Saved loss curve → {out_path}")
 
 
-def plot_yaw_series(real: np.ndarray, generated: np.ndarray,
-                    out_path: Path, n_show: int = 3):
-    """Plot yaw angle over time for real and generated trajectories."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4), sharey=True)
-
-    n_real = min(n_show, len(real))
-    n_gen  = min(n_show, len(generated))
-
-    for i in range(n_real):
-        axes[0].plot(real[i, 3, :], alpha=0.8, label=f"Real {i+1}")
-    axes[0].set_title("Real Yaw Trajectories")
-    axes[0].set_xlabel("Step")
-    axes[0].set_ylabel("Yaw (rad)")
-    axes[0].legend(fontsize=8)
-
-    for i in range(n_gen):
-        axes[1].plot(generated[i, 3, :], alpha=0.8, linestyle="--",
-                     label=f"Gen {i+1}")
-    axes[1].set_title("Generated Yaw Angle Over Time")
-    axes[1].set_xlabel("Step")
-    axes[1].legend(fontsize=8)
-
-    fig.suptitle("Yaw Angle Time Series Comparison", fontsize=13)
+def plot_series(real: dict, gen: dict, out_path: Path, n_show: int = 4):
+    fig, axes = plt.subplots(3, 2, figsize=(14, 9), sharex=True)
+    t = np.arange(real["roll"].shape[1])
+    for col, (d, name) in enumerate(((real, "Real (held-out)"), (gen, "Generated"))):
+        idx = np.linspace(0, len(d["roll"]) - 1, n_show).astype(int)
+        for i in idx:
+            axes[0, col].plot(t, D(d["roll"][i]), lw=1)
+            axes[1, col].plot(t, D(d["pitch"][i]), lw=1)
+            axes[2, col].plot(t, d["alt"][i], lw=1)
+        axes[0, col].set_title(name)
+    for r, lab in enumerate(("Roll (deg)", "Pitch (deg)", "Alt change (m)")):
+        axes[r, 0].set_ylabel(lab)
+    axes[2, 0].set_xlabel("Step (0.1 s)")
+    axes[2, 1].set_xlabel("Step (0.1 s)")
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
-    logger.info(f"Saved yaw series → {out_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4.  REPORT PRINTER
-# ──────────────────────────────────────────────────────────────────────────────
-# ------------------------------------------------------------------------------
-
-def _row(label, real_val, gen_val, fmt=".4f", unit=""):
-    r = f"{real_val:{fmt}}"
-    g = f"{gen_val:{fmt}}"
-    diff_pct = abs(gen_val - real_val) / (abs(real_val) + 1e-8) * 100
-    flag = "[!]" if diff_pct > 50 else "[ok]"
-    return f"  {flag} {label:<30} Real: {r:>12}{unit}  |  Gen: {g:>12}{unit}  |  D={diff_pct:.1f}%"
-
-
-def print_report(real_m: dict, gen_m: dict, mmd2: float):
-    """Print a formatted evaluation report to stdout."""
-    sep = "-" * 80
-    print()
-    print(sep)
-    print("  EVALUATION REPORT -- Kinematic-Guided Trajectory Diffusion Model")
-    print(sep)
-    print()
-    print("  KINEMATIC METRICS")
-    print(_row("Mean yaw rate",        real_m["mean_yaw_rate_rad"],   gen_m["mean_yaw_rate_rad"],   unit=" rad/step"))
-    print(_row("Max yaw rate",         real_m["max_yaw_rate_rad"],    gen_m["max_yaw_rate_rad"],    unit=" rad/step"))
-    print(_row("Mean speed",           real_m["mean_speed_ms"],       gen_m["mean_speed_ms"],       unit=" m/s"))
-    print(_row("Velocity smoothness",  real_m["velocity_smoothness"], gen_m["velocity_smoothness"], unit=" m/s²"))
-    print(_row("Kinematic cost J(s)",  real_m["kinematic_cost_J"],    gen_m["kinematic_cost_J"],    unit=""))
-    print()
-    print("  DISTRIBUTION METRIC")
-    interp = "~0 (distributions match)" if abs(mmd2) < 0.05 else "> 0 (distributions differ)"
-    print(f"  {'MMD2 (RBF kernel)':<30} {mmd2:.6f}  {interp}")
-    print()
-    print(sep)
-    print()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 5.  MAIN
+# 4.  MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
-def evaluate(config: dict, generated_csv: str):
-    output_dir = Path(config["data"]["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
+def evaluate(config: dict, generated_csv: str, checkpoint: str = None) -> dict:
+    out_dir = Path(config["data"]["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seq, stride = config["data"]["sequence_length"], config["data"]["stride"]
 
-    # ── Load real trajectories ────────────────────────────────────────────────
-    logger.info("Loading real trajectories for evaluation …")
-    trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
-    dataset = TrajectoryDataset.from_config(trajectories, config["data"], mean_dt_s)
+    # ── Real data, split by log exactly as in training ───────────────────────
+    split = load_split(config)
+    dt = split["dt_s"]
+    train_ds = TrajectoryDataset.from_config(
+        select_features(split["train"], split["feat_idx"]), config["data"], dt)
+    stats, cal, speed = train_ds.stats, calibrate_guidance(train_ds), split["mean_speed_ms"]
+    if checkpoint:
+        ck = torch.load(checkpoint, map_location="cpu")
+        if "norm" in ck:
+            stats, cal, speed = ck["norm"], ck["guidance_calibration"], ck["mean_speed_ms"]
+            if ck.get("val_files") and ck["val_files"] != split["val_files"]:
+                logger.warning("Checkpoint was trained with a different val split than the current config.")
 
-    # Denormalise real data: dataset.data is [N, 3, L] in normalised form
-    real_norm = dataset.data                         # [N, 3, L]
-    real_phys = dataset.denormalise(real_norm)       # [N, 3, L]  physical units
-    real_np   = real_phys.numpy()                    # [N, 3, L]
-    
-    from src.sample import reconstruct_trajectory
-    n_samples_real = real_np.shape[0]
-    seq_len = config["data"]["sequence_length"]
-    real_6d = np.zeros((n_samples_real, 6, seq_len), dtype=np.float32)
-    for i in range(n_samples_real):
-        # roll=0, pitch=1, alt=2
-        roll = real_np[i, 0]
-        pitch = real_np[i, 1]
-        alt = real_np[i, 2]
-        traj_6d = reconstruct_trajectory(roll, pitch, alt, mean_speed_ms, mean_dt_s)
-        real_6d[i] = traj_6d.T
-        
-    real_np = real_6d
+    tr_raw = real_windows(split["train"], seq, stride)
+    va_raw = real_windows(split["val"], seq, stride)
+    sym = config["data"].get("mirror_roll", False)
+    tr = concat(tr_raw, mirror(tr_raw)) if sym else tr_raw
+    va = concat(va_raw, mirror(va_raw)) if sym else va_raw
+    # Rebuild generated paths here so they use exactly the same dead reckoning
+    # as the real-data check below (independent of how the CSV was written).
+    gen = dead_reckon(load_generated(generated_csv, seq), speed, dt)
+    logger.info(f"Windows: real-train {len(tr_raw['roll'])}, real-val {len(va_raw['roll'])}"
+                f"{' (x2 mirrored)' if sym else ''}, generated {len(gen['roll'])}")
 
-    # ── Load generated trajectories ───────────────────────────────────────────
-    logger.info(f"Loading generated trajectories from: {generated_csv}")
-    df = pd.read_csv(generated_csv)
-    n_samples   = df["sample_id"].max() + 1
-    n_features  = 6
-    feat_cols   = FEATURE_NAMES[:n_features]
+    # ── Metrics ──────────────────────────────────────────────────────────────
+    m_tr, m_va, m_gen = (window_metrics(d, dt, cal) for d in (tr, va, gen))
+    m_va_raw = window_metrics(va_raw, dt, cal)
 
-    gen_np = np.zeros((n_samples, n_features, seq_len), dtype=np.float32)
-    for sid in range(n_samples):
-        sub = df[df["sample_id"] == sid].sort_values("step")
-        for f_idx, col in enumerate(feat_cols):
-            gen_np[sid, f_idx, :] = sub[col].values[:seq_len]
+    # Dead-reckoning check on real held-out windows
+    rec = dead_reckon(va_raw, speed, dt)
+    end_err = np.hypot(rec["N"][:, -1] - va_raw["N"][:, -1], rec["E"][:, -1] - va_raw["E"][:, -1])
+    path_len = (va_raw["speed"][:, :-1] * dt).sum(1)
+    hdg_err = D(np.abs(rec["course"][:, -1] - va_raw["course"][:, -1]))
 
-    logger.info(f"Real: {real_np.shape}  |  Generated: {gen_np.shape}")
+    # MMD on summary features, standardised with real-train
+    F_tr, F_va, F_gen = (summary_features(d, dt) for d in (tr, va, gen))
+    mu, sd = F_tr.mean(0), F_tr.std(0) + 1e-9
+    F_tr, F_va, F_gen = ((F - mu) / sd for F in (F_tr, F_va, F_gen))
+    allF = np.concatenate([F_tr, F_va])
+    sigma = np.sqrt(np.median(((allF[:, None] - allF[None]) ** 2).sum(-1)) / 2)
+    mmd_ref = mmd2(F_tr, F_va, sigma)
+    mmd_gen_va = mmd2(F_gen, F_va, sigma)
+    mmd_gen_tr = mmd2(F_gen, F_tr, sigma)
 
-    # ── Kinematic metrics ─────────────────────────────────────────────────────
-    diff_cfg = config["diffusion"]
-    real_km = kinematic_metrics(real_np, diff_cfg, mean_dt_s)
-    gen_km  = kinematic_metrics(gen_np,  diff_cfg, mean_dt_s)
+    # Memorisation: nearest training window
+    R_tr, R_va, R_gen = (raw_vectors(d, stats) for d in (tr, va, gen))
+    nn_va, nn_gen = nn_distance(R_va, R_tr), nn_distance(R_gen, R_tr)
+    copy_thr = np.percentile(nn_va, 5)
+    copied_pct = 100.0 * (nn_gen < copy_thr).mean()
 
-    # ── MMD ───────────────────────────────────────────────────────────────────
-    mmd2 = compute_mmd(real_np, gen_np)
+    # ── Report ───────────────────────────────────────────────────────────────
+    lines = []
+    sep = "-" * 92
+    lines += [sep, "  EVALUATION REPORT — generated vs real AUTO flight", sep,
+              f"  real-train: {len(split['train_files'])} logs, {len(tr_raw['roll'])} windows | "
+              f"real-val: {len(split['val_files'])} logs, {len(va_raw['roll'])} windows | "
+              f"generated: {len(gen['roll'])}",
+              f"  real sets {'include their mirror image' if sym else 'are not mirrored'}; "
+              f"dt = {dt:.2f} s; window = {seq * dt:.1f} s", ""]
+    lines.append(f"  {'metric':<28}{'unit':>6}{'real-train':>12}{'real-val':>12}{'generated':>12}   gen vs real")
+    for key, label, unit in METRICS:
+        a, b, g = m_tr[key], m_va[key], m_gen[key]
+        lo, hi = min(a, b), max(a, b)
+        spread = max(hi - lo, 0.15 * max(abs(a), abs(b)), 1e-9)
+        flag = "ok" if lo - spread <= g <= hi + spread else ("HIGH" if g > hi else "LOW")
+        lines.append(f"  {label:<28}{unit:>6}{a:>12.2f}{b:>12.2f}{g:>12.2f}   {flag}")
+    lines += ["",
+              f"  Left-turn windows in raw held-out logs (not mirrored): {m_va_raw['left_pct']:.0f}%",
+              "",
+              "  DISTRIBUTION (MMD^2 on 11 per-window summary features, lower = closer)",
+              f"    real-train vs real-val (reference) : {mmd_ref:.4f}",
+              f"    generated  vs real-val             : {mmd_gen_va:.4f}",
+              f"    generated  vs real-train           : {mmd_gen_tr:.4f}",
+              "",
+              "  MEMORISATION (distance to the nearest training window, normalised units)",
+              f"    real-val  median : {np.median(nn_va):.2f}",
+              f"    generated median : {np.median(nn_gen):.2f}",
+              f"    generated closer than the closest 5% of real-val: {copied_pct:.0f}% (about 5% expected)",
+              "",
+              "  DEAD-RECKONING CHECK (real held-out roll -> path, vs GPS)",
+              f"    end-point error   median {np.median(end_err):.0f} m (p90 {np.percentile(end_err, 90):.0f} m) "
+              f"over a median {np.median(path_len):.0f} m path",
+              f"    heading error     median {np.median(hdg_err):.0f} deg (p90 {np.percentile(hdg_err, 90):.0f} deg)",
+              f"    -> generated paths are indicative only; roll/pitch/alt are the direct comparison",
+              sep]
+    report = "\n".join(lines)
+    print(report)
+    (out_dir / "eval_report.txt").write_text(report + "\n", encoding="utf-8")
 
-    # ── Print report ──────────────────────────────────────────────────────────
-    print_report(real_km, gen_km, mmd2)
+    result = {
+        "real_train": m_tr, "real_val": m_va, "generated": m_gen,
+        "mmd2": {"train_vs_val": mmd_ref, "gen_vs_val": mmd_gen_va, "gen_vs_train": mmd_gen_tr},
+        "memorisation": {"nn_val_median": float(np.median(nn_va)),
+                         "nn_gen_median": float(np.median(nn_gen)), "copied_pct": copied_pct},
+        "dead_reckoning": {"end_err_median_m": float(np.median(end_err)),
+                           "heading_err_median_deg": float(np.median(hdg_err))},
+        "val_files": split["val_files"],
+    }
+    (out_dir / "eval_metrics.json").write_text(json.dumps(result, indent=2, default=float), encoding="utf-8")
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
-    plot_3d_trajectories(real_np, gen_np,
-                         output_dir / "eval_3d_trajectories.png")
-    plot_2d_trajectories(real_np, gen_np,
-                         output_dir / "eval_2d_trajectories.png")
-    plot_feature_histograms(real_np, gen_np,
-                            output_dir / "eval_feature_histograms.png")
-    plot_loss_curve(
-        Path(config["data"]["checkpoint_dir"]) / "loss_history.csv",
-        output_dir / "eval_loss_curve.png",
-    )
-    plot_yaw_series(real_np, gen_np,
-                    output_dir / "eval_yaw_series.png")
+    # ── Plots ────────────────────────────────────────────────────────────────
+    plot_paths(va_raw, gen, out_dir / "eval_paths.png")
+    plot_dead_reckoning(va_raw, rec, out_dir / "eval_dead_reckoning.png")
+    plot_histograms(concat(tr, va), gen, dt, out_dir / "eval_histograms.png")
+    plot_series(va_raw, gen, out_dir / "eval_series.png")
+    plot_loss_curve(Path(config["data"]["checkpoint_dir"]) / "loss_history.csv",
+                    out_dir / "eval_loss_curve.png")
+    logger.info(f"Report and plots saved to {out_dir}")
+    return result
 
-    logger.info("Evaluation complete. Plots saved to outputs/")
-    return {"real": real_km, "generated": gen_km, "mmd2": mmd2}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate the trajectory diffusion model"
-    )
-    parser.add_argument("--config",    type=str,
-                        default="configs/default.yaml")
-    parser.add_argument("--generated", type=str,
-                        default="outputs_3feat/generated_trajectories.csv",
-                        help="Path to the generated trajectories CSV")
+    parser = argparse.ArgumentParser(description="Evaluate the trajectory diffusion model")
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--generated", type=str, default=None,
+                        help="Generated CSV (default: sampling.output_csv)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Checkpoint whose stored stats/calibration to use (optional)")
     args = parser.parse_args()
-
     cfg = yaml.safe_load(open(args.config))
-    evaluate(cfg, args.generated)
+    evaluate(cfg, args.generated or cfg["sampling"]["output_csv"], args.checkpoint)

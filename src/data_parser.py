@@ -38,6 +38,8 @@ import argparse
 import hashlib
 import logging
 import math
+import pickle
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -420,8 +422,14 @@ def parse_directory(
     max_gap_s: float = 0.3,
     gps_timeout_s: float = 1.0,
     max_pos_jump_m: float = 3.0,
+    use_cache: bool = True,
 ) -> tuple:
     """Parse every ``.bin`` in ``data_dir`` (byte-identical duplicates skipped).
+
+    Parsed segments are cached in ``<data_dir>/.cache/`` keyed on the parser
+    settings, the parser source and each log's name/size/mtime, so repeated
+    runs skip the slow log decoding.  Pass ``feature_names=FULL_COLUMNS`` to get
+    every column (N, E, velocities, yaw, ... -- used by evaluation).
 
     Returns
     -------
@@ -435,6 +443,18 @@ def parse_directory(
     bin_files = sorted(data_dir.glob("*.bin"))
     if not bin_files:
         raise FileNotFoundError(f"No .bin files found in {data_dir}")
+
+    params = (min_mission_samples, resample_hz, tuple(modes), min_speed_ms,
+              max_gap_s, gps_timeout_s, max_pos_jump_m)
+    key_src = repr(params) + Path(__file__).read_text(encoding="utf-8") + "".join(
+        f"{f.name}:{f.stat().st_size}:{f.stat().st_mtime_ns};" for f in bin_files)
+    cache_file = data_dir / ".cache" / f"parsed_{hashlib.md5(key_src.encode()).hexdigest()[:16]}.pkl"
+    if use_cache and cache_file.exists():
+        with open(cache_file, "rb") as fh:
+            all_segments, meta, mean_speed = pickle.load(fh)
+        logger.info(f"Loaded {len(all_segments)} parsed segment(s) from cache {cache_file.name}")
+        out = (_select(all_segments, feature_names), 1.0 / resample_hz, mean_speed)
+        return out + (meta,) if return_meta else out
 
     all_segments: List[np.ndarray] = []
     meta: List[dict] = []
@@ -466,11 +486,17 @@ def parse_directory(
     if not 3.0 < mean_speed < 150.0:
         logger.warning(f"Mean speed {mean_speed:.1f} m/s looks implausible — check the logs.")
 
+    if use_cache:
+        cache_file.parent.mkdir(exist_ok=True)
+        with open(cache_file, "wb") as fh:
+            pickle.dump((all_segments, meta, mean_speed), fh)
+
     out = (_select(all_segments, feature_names), 1.0 / resample_hz, mean_speed)
     return out + (meta,) if return_meta else out
 
 
-def parse_directory_from_config(data_cfg: dict, return_meta: bool = False) -> tuple:
+def parse_directory_from_config(data_cfg: dict, return_meta: bool = False,
+                                feature_names: Optional[Sequence[str]] = None) -> tuple:
     """``parse_directory`` with arguments taken from the ``data:`` config block."""
     return parse_directory(
         data_cfg["data_dir"],
@@ -478,12 +504,67 @@ def parse_directory_from_config(data_cfg: dict, return_meta: bool = False) -> tu
         resample_hz=data_cfg.get("resample_hz", 10.0),
         modes=data_cfg.get("modes", ["AUTO"]),
         min_speed_ms=data_cfg.get("min_speed_ms", 10.0),
-        feature_names=data_cfg.get("feature_names", list(DEFAULT_FEATURES)),
+        feature_names=feature_names or data_cfg.get("feature_names", list(DEFAULT_FEATURES)),
         return_meta=return_meta,
         max_gap_s=data_cfg.get("max_gap_s", 0.3),
         gps_timeout_s=data_cfg.get("gps_timeout_s", 1.0),
         max_pos_jump_m=data_cfg.get("max_pos_jump_m", 3.0),
     )
+
+
+def split_by_log(meta: List[dict], lengths: Sequence[int], val_fraction: float = 0.15,
+                 seed: int = 42) -> Tuple[List[int], List[int]]:
+    """Split segment indices into train / val so that no log file is in both.
+
+    Log files are shuffled with ``seed`` and moved to validation until it holds
+    at least ``val_fraction`` of all (usable) samples.
+    """
+    files = sorted({m["file"] for m in meta})
+    random.Random(seed).shuffle(files)
+    total = float(sum(lengths))
+    val_files, val_n = set(), 0
+    for f in files:
+        if val_n >= val_fraction * total:
+            break
+        n = sum(k for m, k in zip(meta, lengths) if m["file"] == f)
+        if n == 0:
+            continue
+        val_files.add(f)
+        val_n += n
+    train_idx = [i for i, m in enumerate(meta) if m["file"] not in val_files]
+    val_idx = [i for i, m in enumerate(meta) if m["file"] in val_files]
+    return train_idx, val_idx
+
+
+def load_split(config: dict) -> dict:
+    """Parse the logs once (all columns) and split them by log file.
+
+    Returns a dict with ``train`` / ``val`` lists of full-column segments
+    (columns = FULL_COLUMNS), the model feature indices ``feat_idx``,
+    ``train_files`` / ``val_files``, ``dt_s`` and ``mean_speed_ms``
+    (mean ground speed of the training segments).
+    """
+    data_cfg = config["data"]
+    segs, dt, _, meta = parse_directory_from_config(
+        data_cfg, return_meta=True, feature_names=FULL_COLUMNS)
+    seq = data_cfg["sequence_length"]
+    lengths = [len(x) if len(x) >= seq else 0 for x in segs]   # unusable segments weigh 0
+    tr, va = split_by_log(meta, lengths, data_cfg.get("val_fraction", 0.15),
+                          config["training"].get("seed", 42))
+    names = list(data_cfg.get("feature_names", DEFAULT_FEATURES))
+    train = [segs[i] for i in tr]
+    return {
+        "train": train, "val": [segs[i] for i in va],
+        "train_files": sorted({meta[i]["file"] for i in tr}),
+        "val_files": sorted({meta[i]["file"] for i in va}),
+        "feat_idx": [COL[n] for n in names], "feature_names": names,
+        "dt_s": dt, "mean_speed_ms": _mean_speed(train),
+    }
+
+
+def select_features(segments: List[np.ndarray], feat_idx: Sequence[int]) -> List[np.ndarray]:
+    """Pick model channels from full-column segments."""
+    return [np.ascontiguousarray(x[:, list(feat_idx)]) for x in segments]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -527,6 +608,7 @@ class TrajectoryDataset(Dataset):
         mean_dt_s: float = 0.1,
         relative_channels: Sequence[int] = (),
         mirror_channels: Sequence[int] = (),
+        stats: Optional[dict] = None,
     ):
         super().__init__()
         self.seq_len    = sequence_length
@@ -537,10 +619,12 @@ class TrajectoryDataset(Dataset):
 
         # ── Sliding-window segmentation ───────────────────────────────────────
         windows = []
-        for traj in trajectories:
+        self.window_index = []   # (segment index, start sample) per window
+        for k, traj in enumerate(trajectories):
             T = len(traj)
             for start in range(0, T - sequence_length + 1, stride):
                 windows.append(traj[start : start + sequence_length])  # [L, F]
+                self.window_index.append((k, start))
 
         if not windows:
             raise ValueError(
@@ -555,12 +639,17 @@ class TrajectoryDataset(Dataset):
             data[:, :, c] -= data[:, :1, c]
 
         # ── Z-score normalisation (per feature channel, across all windows) ──
-        self.mean = data.mean(axis=(0, 1))          # [F]
-        self.std  = data.std(axis=(0, 1)) + 1e-8    # [F]  (avoid div/0)
-        for c in self.mirror_channels:
-            # Statistics of the data plus its mirror image: mean 0, RMS scale.
-            self.mean[c] = 0.0
-            self.std[c]  = float(np.sqrt(np.mean(data[:, :, c] ** 2))) + 1e-8
+        if stats is not None:
+            # Reuse statistics from another split (e.g. train stats for val).
+            self.mean = np.asarray(stats["mean"], dtype=np.float32).copy()
+            self.std  = np.asarray(stats["std"],  dtype=np.float32).copy()
+        else:
+            self.mean = data.mean(axis=(0, 1))          # [F]
+            self.std  = data.std(axis=(0, 1)) + 1e-8    # [F]  (avoid div/0)
+            for c in self.mirror_channels:
+                # Statistics of the data plus its mirror image: mean 0, RMS scale.
+                self.mean[c] = 0.0
+                self.std[c]  = float(np.sqrt(np.mean(data[:, :, c] ** 2))) + 1e-8
         data_norm = (data - self.mean) / self.std   # [N, L, F]
 
         # Transpose to channel-first: [N, 7, L]
@@ -573,7 +662,8 @@ class TrajectoryDataset(Dataset):
         )
 
     @classmethod
-    def from_config(cls, trajectories: List[np.ndarray], data_cfg: dict, mean_dt_s: float):
+    def from_config(cls, trajectories: List[np.ndarray], data_cfg: dict, mean_dt_s: float,
+                    stats: Optional[dict] = None):
         """Build the dataset with the window and augmentation settings from the
         ``data:`` config block (used by train, sample and evaluate alike)."""
         names = list(data_cfg.get("feature_names", DEFAULT_FEATURES))
@@ -586,7 +676,16 @@ class TrajectoryDataset(Dataset):
             mean_dt_s=mean_dt_s,
             relative_channels=relative,
             mirror_channels=mirror,
+            stats=stats,
         )
+
+    @property
+    def stats(self) -> dict:
+        """Normalisation statistics (stored in checkpoints)."""
+        return {"mean": [float(v) for v in self.mean], "std": [float(v) for v in self.std],
+                "relative_channels": self.relative_channels,
+                "mirror_channels": self.mirror_channels,
+                "mean_dt_s": self.mean_dt_s}
 
     def mirror_batch(self, x: torch.Tensor) -> torch.Tensor:
         """Mirror a random half of a normalised batch [B, F, L] left/right."""

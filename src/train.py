@@ -31,13 +31,14 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 import yaml
 
-from src.data_parser import parse_directory_from_config, TrajectoryDataset
+from src.data_parser import load_split, select_features, TrajectoryDataset
 from src.diffusion_math import CosineNoiseScheduler
-from src.unet_1d import UNet1D
+from src.sample import calibrate_guidance
+from src.unet_1d import build_model, core_module
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -57,13 +58,16 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, path):
+def save_checkpoint(model, optimizer, epoch, loss, path, extra=None):
+    """Save weights (of the bare UNet1D) plus ``extra`` metadata: normalisation
+    stats, guidance calibration and the train/val log split."""
     torch.save(
         {
             "epoch":     epoch,
             "loss":      loss,
-            "model":     model.state_dict(),
+            "model":     core_module(model).state_dict(),
             "optimizer": optimizer.state_dict(),
+            **(extra or {}),
         },
         path,
     )
@@ -72,7 +76,7 @@ def save_checkpoint(model, optimizer, epoch, loss, path):
 
 def load_checkpoint(model, optimizer, path, device):
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    core_module(model).load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     return ckpt["epoch"], ckpt["loss"]
 
@@ -93,22 +97,18 @@ def train(config: dict):
     ckpt_dir = Path(config["data"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Data ─────────────────────────────────────────────────────────────────
+    # ── Data: split by log file so no flight is in both train and val ────────
     logger.info(f"Loading trajectories from: {config['data']['data_dir']}")
-    trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
-
-    dataset = TrajectoryDataset.from_config(trajectories, config["data"], mean_dt_s)
-
-    # 90/10 train/val split
-    n_val   = max(1, int(len(dataset) * 0.1))
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(seed),
-    )
+    split = load_split(config)
+    dataset = TrajectoryDataset.from_config(
+        select_features(split["train"], split["feat_idx"]), config["data"], split["dt_s"])
+    val_ds = TrajectoryDataset.from_config(
+        select_features(split["val"], split["feat_idx"]), config["data"], split["dt_s"],
+        stats=dataset.stats)
+    logger.info(f"Validation logs: {', '.join(split['val_files'])}")
 
     train_loader = DataLoader(
-        train_ds,
+        dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=True,
         num_workers=config["training"]["num_workers"],
@@ -123,18 +123,24 @@ def train(config: dict):
         pin_memory=(device.type == "cuda"),
     )
 
-    logger.info(f"Dataset: {len(train_ds)} train | {len(val_ds)} val windows")
+    logger.info(f"Dataset: {len(dataset)} train | {len(val_ds)} val windows "
+                f"({len(split['train_files'])} / {len(split['val_files'])} logs)")
+
+    # Everything sampling needs, so it does not have to re-parse the logs.
+    ckpt_extra = {
+        "norm": dataset.stats,
+        "guidance_calibration": calibrate_guidance(dataset),
+        "mean_speed_ms": split["mean_speed_ms"],
+        "train_files": split["train_files"],
+        "val_files": split["val_files"],
+        "feature_names": split["feature_names"],
+    }
 
     # ── Model ────────────────────────────────────────────────────────────────
-    model = UNet1D(
-        in_channels=config["model"]["in_channels"],
-        base_channels=config["model"]["base_channels"],
-        depth=config["model"]["depth"],
-        time_emb_dim=config["model"]["time_emb_dim"],
-    ).to(device)
+    model = build_model(config).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"UNet1D parameters: {n_params:,}")
+    logger.info(f"{type(model).__name__} parameters: {n_params:,}")
 
     # ── Noise scheduler ──────────────────────────────────────────────────────
     scheduler = CosineNoiseScheduler(
@@ -223,17 +229,23 @@ def train(config: dict):
         train_loss /= len(train_loader)
 
         # ── Validate ──────────────────────────────────────────────────────────
+        # Fixed timesteps and noise every epoch (and 4 passes) so the curve is
+        # comparable between epochs instead of dominated by sampling noise.
         model.eval()
-        val_loss = 0.0
+        val_loss, n_val = 0.0, 0
+        gen = torch.Generator().manual_seed(seed)
         with torch.no_grad():
-            for batch in val_loader:
-                x0 = batch.to(device)
-                B  = x0.shape[0]
-                t  = torch.randint(0, T, (B,), device=device)
-                x_t, noise = scheduler.q_sample(x0, t)
-                eps_pred   = model(x_t, t)
-                val_loss  += F.mse_loss(eps_pred, noise).item()
-        val_loss /= len(val_loader)
+            for _ in range(4):
+                for batch in val_loader:
+                    x0 = val_ds.mirror_batch(batch.to(device))
+                    B  = x0.shape[0]
+                    t  = torch.randint(0, T, (B,), generator=gen).to(device)
+                    noise = torch.randn(x0.shape, generator=gen).to(device)
+                    x_t, noise = scheduler.q_sample(x0, t, noise)
+                    eps_pred   = model(x_t, t)
+                    val_loss  += F.mse_loss(eps_pred, noise).item() * B
+                    n_val     += B
+        val_loss /= n_val
 
         elapsed = time.time() - t0
 
@@ -250,7 +262,7 @@ def train(config: dict):
         # ── Save checkpoint ───────────────────────────────────────────────────
         if (epoch + 1) % ckpt_every == 0 or epoch == epochs - 1:
             ckpt_path = ckpt_dir / f"epoch_{epoch+1:04d}.pt"
-            save_checkpoint(model, optimizer, epoch, val_loss, ckpt_path)
+            save_checkpoint(model, optimizer, epoch, val_loss, ckpt_path, ckpt_extra)
 
     logger.info("Training complete.")
 

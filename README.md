@@ -26,16 +26,16 @@ The model generates time series of **roll, pitch and altitude**. A 2D/3D flight 
 ```
 .bin logs ──► data_parser ──► AUTO [roll, pitch, alt] @ 10 Hz ──► sliding windows (128 × 3)
                                                                    │
-                                     altitude relative to window start, z-score
-                                     normalisation, random left/right mirroring
+                       split by log file (train / held-out val), altitude relative
+                       to window start, z-score normalisation, random mirroring
                                                                    ▼
-                                     train.py: 1D U-Net learns ε_θ(x_t, t)
+                     train.py: mirror-symmetric 1D U-Net learns ε_θ(x_t, t)
                                                                    │
                          sample.py: DDIM (50 steps) + kinematic guidance
                                                                    │
                      denormalise ──► dead-reckon N/E/yaw from roll ──► CSV
                                                                    │
-                                       evaluate.py: metrics + plots
+           evaluate.py: vs real GPS paths of train / held-out logs
 ```
 
 ---
@@ -68,8 +68,10 @@ If a log has no EKF messages, the parser falls back to `GPS` for position/veloci
    - free of EKF resets (position step within `max_pos_jump_m` of what velocity predicts).
 3. **Segment**: contiguous kept runs of at least `min_mission_samples` samples become segments.
 4. **Deduplicate**: byte-identical log files (the same flight saved under two names) are parsed once.
-5. **Window**: `TrajectoryDataset` cuts sliding windows (`sequence_length`, `stride`). With `relative_alt`, altitude becomes the change since the window start. Each channel is then z-score normalised.
-6. **Mirror** (training only): with `mirror_roll`, roll is negated for a random half of every batch, since the airframe can fly the same manoeuvre to the left or right. Roll is normalised symmetrically (mean 0), so a mirrored sample is exactly `-roll` in normalised space.
+   Parsed segments are cached in `data/.cache/` (keyed on the parser settings, the parser code and each log's size and date), so later runs load in seconds instead of minutes.
+5. **Split by log**: whole log files are held out for validation (`val_fraction`, seeded by `training.seed`) so overlapping windows of one flight never end up on both sides. Currently 36 logs / 170 windows train, 7 logs / 33 windows validation.
+6. **Window**: `TrajectoryDataset` cuts sliding windows (`sequence_length`, `stride`). With `relative_alt`, altitude becomes the change since the window start. Each channel is then z-score normalised with the training-set statistics, which are stored in every checkpoint.
+7. **Mirror** (training only): with `mirror_roll`, roll is negated for a random half of every batch, since the airframe can fly the same manoeuvre to the left or right. Roll is normalised symmetrically (mean 0), so a mirrored sample is exactly `-roll` in normalised space.
 
 Each segment carries all columns in `FULL_COLUMNS` (`N, E, alt, vN, vE, vD, roll, pitch, yaw, airspeed`); `feature_names` picks the model channels.
 
@@ -138,7 +140,18 @@ $$\mathcal{L} =
     \overline{\left(\hat{x}_{0,c}[i{+}1] - 2\hat{x}_{0,c}[i] + \hat{x}_{0,c}[i{-}1]\right)^2}$$
 
 where $\hat{\mathbf{x}}_0 = \left(\mathbf{x}_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\theta\right)/\sqrt{\bar\alpha_t}$. The $\bar\alpha_t$ weight keeps the penalty to low-noise steps; without it, the $1/\sqrt{\bar\alpha_t}$ factor inflated the gradient about 10,000× at high noise and gave the sampler a strong one-sided roll bias.
-The validation loss reports $\mathcal{L}_{\text{simple}}$ only.
+The validation loss reports $\mathcal{L}_{\text{simple}}$ only, on the held-out logs with fixed noise and timesteps.
+
+**Mirror symmetry.** Random mirroring alone did not make the network symmetric:
+even from mirrored starting noise, v5 generated 70–75 % right turns. With
+`mirror_symmetric` the network is wrapped as
+
+$$\hat\epsilon(\mathbf{x}, t) = \tfrac12\left[\epsilon_\theta(\mathbf{x}, t) + M\,\epsilon_\theta(M\mathbf{x}, t)\right]$$
+
+where $M$ flips the sign of roll. Then $\hat\epsilon(M\mathbf{x}, t) = M\,\hat\epsilon(\mathbf{x}, t)$
+exactly, and since the starting noise is symmetric too, left and right turns are
+equally likely by construction (both halves run as one batch, used in training
+and sampling).
 
 ### 4. DDIM Reverse Process (Sampling)
 
@@ -162,34 +175,67 @@ $$\sigma_{\tau_i} = \eta
 
 ### 5. Kinematic Guidance
 
-At every DDIM step the predicted clean window is denormalised to physical units
-($\phi$ roll, $\theta$ pitch, $z$ altitude), and the gradient of a kinematic
-cost $J$ is subtracted:
+At every DDIM step the predicted clean window $\hat{\mathbf{x}}_0$ is corrected
+by a kinematic cost $J$, evaluated in physical units ($\phi$ roll, $\theta$
+pitch, $z$ altitude change, $\Delta t = 0.1$ s). Guidance runs only at sampling
+time, so $w$ and the weights can be changed without retraining.
 
-$$\hat{\mathbf{x}}_0^{\text{guided}}
-= \hat{\mathbf{x}}_0 - w \cdot \operatorname{clip}\!\left(\nabla_{\hat{\mathbf{x}}_0} J,\,-1,\,1\right)$$
-
-**Cost terms** (each averaged over the batch and time):
+**Cost terms** (summed over time, per sample):
 
 | Term | Formula | Meaning |
 |------|---------|---------|
-| Roll smoothness | $J_\phi = \left(\frac{\phi_{i+1}-\phi_i}{\Delta t}\right)^2$ | Penalises roll rate |
-| Pitch–altitude coupling | $J_\theta = \left(\frac{z_{i+1}-z_i}{\Delta t} - V\sin\theta_i\right)^2$ | Climb rate should match pitch at nominal speed $V$ |
-| Attitude limits | $J_b = \lambda_\phi\,\max(0,\lvert\phi\rvert-\phi_{\max})^2 + \lambda_\theta\left[\max(0,\theta_{\min}-\theta)^2 + \max(0,\theta-\theta_{\max})^2\right]$ | $\phi_{\max}=85°$, $\theta \in [-15°, 25°]$ |
+| Roll chatter | $J_\phi = \sum_i \left(\frac{\phi_{i+1}-2\phi_i+\phi_{i-1}}{\sigma_{\ddot\phi}}\right)^2$ | Penalises roll *acceleration*, not roll rate, so real turn entries survive |
+| Pitch–climb coupling | $J_\theta = \sum_i \left(\frac{(z_{i+1}-z_i)/\Delta t - g\sin\theta_i - b}{\sigma_c}\right)^2$ | Climb rate should follow pitch |
+| Attitude limits | $J_b = \sum_i \max(0,\lvert\phi_i\rvert-\phi_{\max})^2/\sigma_\phi^2 + \max(0,\theta_{\min}-\theta_i)^2/\sigma_\theta^2 + \max(0,\theta_i-\theta_{\max})^2/\sigma_\theta^2$ | $\phi_{\max}=90°$, $\theta \in [-20°, 40°]$ |
 
-$$J = \lambda_\phi J_\phi + \lambda_\theta J_\theta + J_b$$
+$g$, $b$, $\sigma_c$ and $\sigma_{\ddot\phi}$ are fitted on the real windows at
+sampling time (`calibrate_guidance` in `sample.py`). On the AUTO data:
+climb ≈ 30.4·sin θ + 0.34 m/s (residual 2.8 m/s) and roll-acceleration RMS 3.4°
+per step². The effective speed $g$ is lower than the 44 m/s ground speed
+because pitch ≠ flight-path angle (angle of attack, wind).
 
-$\Delta t$ and $V$ come from the dataset (0.1 s and the mean ground speed).
-The gradient is computed with `torch.autograd.grad`; no retraining is needed to change $w$ or the weights.
+**Update rule.** One preconditioned gradient step per term and channel:
+
+$$\hat{x}_{0,c} \leftarrow \hat{x}_{0,c} - w\,\bar\alpha_t \sum_k \lambda_k\,
+  \frac{\partial J_k/\partial \hat{x}_{0,c}}{L_{k,c}}$$
+
+- $L_{k,c}$ is the Lipschitz constant of $\nabla J_k$ in channel $c$, so with
+  $w \sum_k \lambda_k \le 1$ a step can never overshoot.
+- $\bar\alpha_t$ keeps guidance off while $\hat{\mathbf{x}}_0$ is still mostly
+  noise.
+- With `pitch_drives_alt` the coupling term corrects only altitude. Pitch is the
+  cleaner channel, and letting the term move pitch copies altitude noise into
+  pitch (tested: up to 80° pitch steps).
+- With `anchor_alt` the altitude is shifted after each step so the window starts
+  at 0 m, matching the relative-altitude training data.
+
+Effect on the v4 model (256 samples, 50 DDIM steps):
+
+| | Real | No guidance | Anchor only | Guidance w = 0.5 |
+|---|---|---|---|---|
+| Roll step, median | 1.04° | 2.85° | 2.07° | 1.15° |
+| Roll 1st–99th percentile | ±84° | −103…+113° | −102…+112° | ±90° |
+| Altitude change std | 23 m | 54 m | 31 m | 30 m |
+| Altitude step, 99th percentile | 1.6 m | 14.2 m | 12.5 m | 2.2 m |
+| Pitch–climb residual RMS | 2.8 m/s | 34 m/s | 29 m/s | 5.4 m/s |
+| MMD² | — | 0.393 | 0.038 | 0.031 |
 
 ### 6. Flight-Path Reconstruction
 
 The model only generates roll, pitch and altitude. N, E and yaw are integrated
 with a coordinated-turn model at constant speed $V$:
 
-$$\psi_{i+1} = \psi_i + \frac{g\tan\phi_i}{V}\,\Delta t,\qquad
+$$\psi_{i+1} = \psi_i + \frac{g\tan\tilde\phi_i}{V}\,\Delta t,\qquad
 N_{i+1} = N_i + V\cos\psi_i\,\Delta t,\qquad
 E_{i+1} = E_i + V\sin\psi_i\,\Delta t$$
+
+with $\tilde\phi$ = roll capped at ±85° (tan explodes near 90°; the real
+aircraft tops out around 100–130 °/s). Checked against GPS on the AUTO data,
+the measured turn rate follows $g\tan\phi/V$ closely up to about 80° of bank,
+and rebuilding the held-out logs' paths from their roll gives a median turn rate
+of 20 °/s vs 19 °/s measured. Over a 12.8 s window (about 600 m) the rebuilt end
+point is still a median 126 m off, mostly because speed is assumed constant, so
+generated paths are indicative; roll, pitch and altitude are the direct output.
 
 ---
 
@@ -200,15 +246,15 @@ Kinematic_Trajectory_Diffusion/
 ├── configs/
 │   └── default.yaml          ← All settings
 ├── data/                     ← .bin logs (git-ignored)
-├── checkpoints_v4/           ← Model weights + loss_history.csv (git-ignored)
-├── outputs_v4/               ← Generated CSV + evaluation plots (git-ignored)
+├── checkpoints_v6/           ← Model weights + loss_history.csv (git-ignored)
+├── outputs_v6/               ← Generated CSV + evaluation plots (git-ignored)
 ├── src/
 │   ├── data_parser.py        ← .bin → filtered 10 Hz segments → TrajectoryDataset
 │   ├── diffusion_math.py     ← CosineNoiseScheduler + KinematicGuidance
-│   ├── unet_1d.py            ← 1D U-Net score network
+│   ├── unet_1d.py            ← 1D U-Net score network + mirror-symmetric wrapper
 │   ├── train.py              ← Training loop
 │   ├── sample.py             ← DDIM sampler, guidance, flight-path reconstruction
-│   └── evaluate.py           ← Metrics (MMD, yaw rate) and plots
+│   └── evaluate.py           ← Comparison with real GPS paths, MMD, memorisation check, plots
 ├── requirements.txt
 └── README.md
 ```
@@ -266,23 +312,65 @@ Total: 64 segments, 49433 samples (82.4 min), mean speed 30.2 m/s, segments >= 2
 python -m src.train --config configs/default.yaml
 ```
 
-Losses are appended to `checkpoints_v4/loss_history.csv`; a checkpoint is saved every `checkpoint_every` epochs.
+Losses are appended to `checkpoints_v6/loss_history.csv`; a checkpoint is saved every `checkpoint_every` epochs.
+Each checkpoint also stores the normalisation statistics, the guidance calibration and the train/val log lists, so sampling does not need the logs.
+
+The validation loss is lowest around epoch 200 and then rises, but sample quality
+keeps improving until epoch 800 (MMD² vs held-out logs 0.19 at epoch 200, 0.14 at
+400, 0.086 at 800) and the memorisation check stays clean. Pick checkpoints with
+`evaluate.py`, not with the validation loss.
 Training **resumes from the newest checkpoint** in `checkpoint_dir`. Use a new folder to start from scratch.
 
 ### 3. Generate trajectories
 
 ```bash
-python -m src.sample --config configs/default.yaml --checkpoint checkpoints_v4/epoch_0800.pt
+python -m src.sample --config configs/default.yaml --checkpoint checkpoints_v6/epoch_0800.pt
 ```
 
 ### 4. Evaluate
 
 ```bash
-python -m src.evaluate --config configs/default.yaml --generated outputs_v4/generated_trajectories.csv
+python -m src.evaluate --config configs/default.yaml --checkpoint checkpoints_v6/epoch_0800.pt
 ```
 
-Prints a report (yaw-rate statistics, MMD² between real and generated windows) and saves to `output_dir`:
-`eval_2d_trajectories.png`, `eval_3d_trajectories.png`, `eval_feature_histograms.png`, `eval_yaw_series.png`, `eval_loss_curve.png`.
+`--generated` defaults to `sampling.output_csv`. The real data is split by log
+exactly as in training:
+
+- **real-train / real-val** are windows from training and held-out logs. Their
+  paths are the **GPS/EKF positions**, rotated so the initial course is north.
+  With `mirror_roll` they are compared together with their mirror image.
+- **Generated paths** are rebuilt from generated roll (section 6).
+- The **dead-reckoning check** rebuilds the held-out logs' paths from their roll
+  and measures how far that lands from GPS.
+
+The report flags each metric `ok`, `HIGH` or `LOW`. `ok` means the generated
+value lies within the real-train / real-val range, widened by that range's width
+(at least 15 %). Other parts of the report:
+
+- **MMD²** on 11 per-window summary features, with **real-train vs real-val** as
+  the reference for "as close as two real sets".
+- A **memorisation** check: the distance from each generated window to its
+  nearest training window, compared with the same distance for held-out
+  windows.
+
+Saved to `output_dir`: `eval_report.txt`, `eval_metrics.json`, `eval_paths.png`
+(GPS vs generated, top-down), `eval_dead_reckoning.png`, `eval_histograms.png`,
+`eval_series.png` and `eval_loss_curve.png`.
+
+Current result (v6, 256 samples, guidance 0.5):
+
+| | Real train | Real held-out | Generated |
+|---|---|---|---|
+| Roll \|median\| / \|p99\| | 57° / 85° | 62° / 86° | 55° / 85° |
+| Time at \|roll\| > 80° | 12 % | 16 % | 8 % |
+| Left-turn windows | 50 % | 50 % | 49 % |
+| Roll step median / p99 | 1.1° / 26° | 0.8° / 34° | 1.2° / 15° |
+| Pitch mean / std | 1.8° / 8.1° | 1.5° / 8.3° | 6.3° / 10.9° |
+| Altitude change std | 23 m | 22 m | 35 m |
+| Pitch–climb residual RMS | 2.9 m/s | 2.4 m/s | 5.2 m/s |
+| Turn rate median / p99 | 19 / 100 °/s | 18 / 133 °/s | 18 / 146 °/s |
+| MMD² vs held-out | 0.0096 (train) | — | 0.086 |
+| Nearest training window, median | — | 8.7 | 11.9 (2 % closer than the closest 5 % of held-out) |
 
 ### Architecture sanity check
 
@@ -299,8 +387,8 @@ python src/unet_1d.py
 | Key | Default | Description |
 |-----|---------|-------------|
 | `data_dir` | `data/` | Folder with `.bin` logs |
-| `output_dir` | `outputs_v4/` | Plots and generated CSV |
-| `checkpoint_dir` | `checkpoints_v4/` | Checkpoints and loss log |
+| `output_dir` | `outputs_v6/` | Plots and generated CSV |
+| `checkpoint_dir` | `checkpoints_v6/` | Checkpoints and loss log |
 | `sequence_length` | 128 | Window length in samples (12.8 s at 10 Hz) |
 | `features` | 3 | Number of model channels |
 | `feature_names` | `[roll, pitch, alt]` | Model channels, from `FULL_COLUMNS` |
@@ -314,6 +402,7 @@ python src/unet_1d.py
 | `stride` | 32 | Sliding-window stride |
 | `relative_alt` | true | Altitude as change since the window start |
 | `mirror_roll` | true | Randomly mirror roll during training |
+| `val_fraction` | 0.15 | Share of samples held out for validation, as whole log files |
 
 ### `diffusion`
 
@@ -321,10 +410,15 @@ python src/unet_1d.py
 |-----|---------|-------------|
 | `T` | 1000 | Diffusion timesteps |
 | `s` | 0.008 | Cosine schedule offset |
-| `guidance_scale` | 0.0 | Guidance strength $w$ (0 = off; see limitations) |
-| `lambda_roll` | 0.5 | Weight of roll smoothness and roll limit |
-| `lambda_pitch` | 1.0 | Weight of pitch–altitude coupling and pitch limits |
-| `lambda_vel` | 0.1 | Not used by the current 3-channel model |
+| `guidance_scale` | 0.5 | Guidance strength $w$ (fraction of a full correction; 0 = off; keep $w(\lambda_{roll}+\lambda_{bound}) \le 1$) |
+| `lambda_roll` | 1.0 | Weight of the roll-acceleration penalty |
+| `lambda_pitch` | 1.0 | Weight of the pitch–climb coupling |
+| `lambda_bound` | 1.0 | Weight of the attitude-limit penalty |
+| `max_roll_deg` | 90 | Roll limit |
+| `min_pitch_deg`, `max_pitch_deg` | −20, 40 | Pitch limits |
+| `pitch_drives_alt` | true | Coupling corrects altitude only |
+| `anchor_alt` | true | Shift altitude so each window starts at 0 m |
+| `guidance_iters` | 1 | Guidance gradient steps per DDIM step |
 
 ### `model`
 
@@ -334,6 +428,7 @@ python src/unet_1d.py
 | `base_channels` | 64 | U-Net base width |
 | `depth` | 3 | Encoder/decoder stages |
 | `time_emb_dim` | 128 | Time-embedding size |
+| `mirror_symmetric` | true | Wrap the network so it is exactly left/right symmetric (needs `mirror_roll`) |
 
 ### `training`
 
@@ -342,10 +437,10 @@ python src/unet_1d.py
 | `batch_size` | 32 | Batch size |
 | `lr` | 1e-4 | AdamW learning rate |
 | `weight_decay` | 1e-5 | AdamW weight decay |
-| `epochs` | 800 | Total epochs (about 6 batches each) |
+| `epochs` | 800 | Total epochs (5 batches each) |
 | `checkpoint_every` | 50 | Checkpoint interval (epochs) |
 | `num_workers` | 0 | DataLoader workers (0 is fastest for this small dataset on Windows) |
-| `seed` | 42 | Random seed (also fixes the train/val split) |
+| `seed` | 42 | Random seed (also picks the held-out logs) |
 | `grad_clip` | 1.0 | Gradient-norm clip |
 | `lambda_smooth` | 0.1 | Weight of the roll/pitch smoothness loss |
 
@@ -353,10 +448,11 @@ python src/unet_1d.py
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `num_samples` | 64 | Trajectories per run |
+| `num_samples` | 256 | Trajectories per run (256 keeps the evaluation metrics stable) |
 | `ddim_steps` | 50 | DDIM steps |
 | `eta` | 0.0 | DDIM stochasticity (0 = deterministic) |
-| `output_csv` | `outputs_v4/generated_trajectories.csv` | Output file |
+| `seed` | 0 | Sampling seed (remove for a different set each run) |
+| `output_csv` | `outputs_v6/generated_trajectories.csv` | Output file |
 
 ---
 
@@ -371,7 +467,7 @@ python src/unet_1d.py
 | `N_m` | m | North, reconstructed from roll (starts at 0) |
 | `E_m` | m | East, reconstructed from roll (starts at 0) |
 | `alt_m` | m | Altitude change since the start of the window (generated) |
-| `yaw_rad` | rad | Heading, reconstructed from roll (starts at 0) |
+| `yaw_rad` | rad | Heading, reconstructed from roll (starts at 0; bank capped at 85°) |
 | `roll_rad` | rad | Roll (generated) |
 | `pitch_rad` | rad | Pitch (generated) |
 
@@ -379,11 +475,11 @@ python src/unet_1d.py
 
 ## Known Limitations
 
-- **The evaluation's "real" flight paths are reconstructed too.** Real N/E/yaw in the plots are rebuilt from real roll with the same model as the generated ones, not taken from GPS. The roll, pitch and altitude histograms are the direct comparison.
-- **Guidance is switched off** (`guidance_scale: 0`). With w = 2 and the gradient clipped to ±1, each DDIM step could move a value by up to 2 standard deviations, which turned altitude into a ±50 m zig-zag. The roll-rate penalty and 85° roll limit also work against the aircraft's real manoeuvres (up to about 400°/s roll).
-- **Pitch–altitude coupling ignores angle of attack.** Level flight at a few degrees nose-up reads as a climb.
-- **The train/val split is random over overlapping windows**, so the validation loss is optimistic. Split by log file for a fair check.
-- **Normalisation statistics are not stored in the checkpoint.** `sample.py` and `evaluate.py` re-parse `data/` to recover them, so the logs must not change between training and sampling.
+- **Small dataset.** 170 training windows from 36 logs; the held-out set is 7 logs / 33 windows, so held-out metrics are noisy.
+- **Pitch and altitude are too spread out.** Generated pitch is about 4.5° too nose-up on average, and altitude change has 1.5× the real spread.
+- **Sharp roll reversals are smoothed.** The largest roll steps (p99) are about half the real ones; the roll-chatter guidance and the training smoothness loss both pull this way.
+- **Generated paths assume constant speed.** They are rebuilt from roll at the mean ground speed (see the dead-reckoning check); the model does not generate speed.
+- **Pitch–climb coupling is a linear fit.** It absorbs angle of attack and wind into one gain and bias; it does not model airspeed changes or turns.
 - **Roll is wrapped to ±180°.** Inverted flight creates jumps between +180° and −180° in the model input.
 
 ---

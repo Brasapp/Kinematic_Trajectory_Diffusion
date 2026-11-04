@@ -1,0 +1,42 @@
+--------------------------------------------------------------------------------------------
+  EVALUATION REPORT — generated vs real AUTO flight
+--------------------------------------------------------------------------------------------
+  real-train: 36 logs, 170 windows | real-val: 7 logs, 33 windows | generated: 256
+  real sets include their mirror image; dt = 0.10 s; window = 12.8 s
+
+  metric                        unit  real-train    real-val   generated   gen vs real
+  Roll std                       deg       56.10       57.85       55.16   ok
+  Roll |median|                  deg       57.40       61.76       55.21   ok
+  Roll |p99|                     deg       85.42       86.09       85.42   ok
+  Time at |roll| > 80 deg          %       11.60       16.31        8.27   ok
+  Roll step median               deg        1.10        0.81        1.21   ok
+  Roll step p99                  deg       25.93       33.85       14.77   LOW
+  Left-turn windows                %       50.00       50.00       48.83   ok
+  Pitch mean                     deg        1.83        1.53        6.34   HIGH
+  Pitch std                      deg        8.12        8.33       10.94   HIGH
+  Pitch step median              deg        0.41        0.38        0.42   ok
+  Alt change std                   m       23.30       21.78       34.76   HIGH
+  Alt change at end, std           m       27.41       24.92       40.85   HIGH
+  Alt step p99                     m        1.67        1.52        2.23   HIGH
+  Pitch-climb residual RMS       m/s        2.85        2.41        5.15   HIGH
+  Turn rate |median|           deg/s       18.71       18.38       18.32   ok
+  Turn rate |p99|              deg/s      100.32      132.97      145.53   ok
+  Heading change / window        deg      255.05      382.77      232.20   ok
+
+  Left-turn windows in raw held-out logs (not mirrored): 33%
+
+  DISTRIBUTION (MMD^2 on 11 per-window summary features, lower = closer)
+    real-train vs real-val (reference) : 0.0096
+    generated  vs real-val             : 0.0855
+    generated  vs real-train           : 0.0992
+
+  MEMORISATION (distance to the nearest training window, normalised units)
+    real-val  median : 8.70
+    generated median : 11.87
+    generated closer than the closest 5% of real-val: 2% (about 5% expected)
+
+  DEAD-RECKONING CHECK (real held-out roll -> path, vs GPS)
+    end-point error   median 126 m (p90 247 m) over a median 608 m path
+    heading error     median 42 deg (p90 221 deg)
+    -> generated paths are indicative only; roll/pitch/alt are the direct comparison
+--------------------------------------------------------------------------------------------

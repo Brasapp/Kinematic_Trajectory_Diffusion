@@ -239,12 +239,7 @@ def sample(config: dict, checkpoint_path: str):
     # ── Rebuild dataset statistics for denormalisation ────────────────────────
     logger.info("Loading dataset to recover normalisation statistics …")
     trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
-    dataset = TrajectoryDataset(
-        trajectories,
-        sequence_length=config["data"]["sequence_length"],
-        stride=config["data"]["stride"],
-        mean_dt_s=mean_dt_s,
-    )
+    dataset = TrajectoryDataset.from_config(trajectories, config["data"], mean_dt_s)
 
     # ── Instantiate model ─────────────────────────────────────────────────────
     model = UNet1D(

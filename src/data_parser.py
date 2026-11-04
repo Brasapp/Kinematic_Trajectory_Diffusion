@@ -509,6 +509,14 @@ class TrajectoryDataset(Dataset):
         Fixed window length in samples.
     stride : int
         Sliding window step.  ``stride = sequence_length`` → no overlap.
+    relative_channels : list of int
+        Channels re-expressed relative to each window's first sample
+        (e.g. altitude → altitude change since the window start).
+    mirror_channels : list of int
+        Channels that flip sign under a left/right mirror of the flight
+        (roll).  Their normalisation is made symmetric (mean 0), so a
+        mirrored sample is exactly ``-x`` in normalised space and training
+        can flip them at random (see ``mirror_batch``).
     """
 
     def __init__(
@@ -517,18 +525,22 @@ class TrajectoryDataset(Dataset):
         sequence_length: int = 256,
         stride: int = 128,
         mean_dt_s: float = 0.1,
+        relative_channels: Sequence[int] = (),
+        mirror_channels: Sequence[int] = (),
     ):
         super().__init__()
         self.seq_len    = sequence_length
         self.stride     = stride
         self.mean_dt_s  = mean_dt_s  # uniform sample interval (s/step)
+        self.relative_channels = list(relative_channels)
+        self.mirror_channels   = list(mirror_channels)
 
         # ── Sliding-window segmentation ───────────────────────────────────────
         windows = []
         for traj in trajectories:
             T = len(traj)
             for start in range(0, T - sequence_length + 1, stride):
-                windows.append(traj[start : start + sequence_length])  # [L, 7]
+                windows.append(traj[start : start + sequence_length])  # [L, F]
 
         if not windows:
             raise ValueError(
@@ -536,14 +548,20 @@ class TrajectoryDataset(Dataset):
                 "Check sequence_length and stride relative to trajectory lengths."
             )
 
-        # Stack into [N, L, 7]
+        # Stack into [N, L, F]
         data = np.stack(windows, axis=0).astype(np.float32)
 
+        for c in self.relative_channels:
+            data[:, :, c] -= data[:, :1, c]
+
         # ── Z-score normalisation (per feature channel, across all windows) ──
-        # mean/std computed over (N, L) dimensions → shape [7]
-        self.mean = data.mean(axis=(0, 1))   # [7]
-        self.std  = data.std(axis=(0, 1)) + 1e-8  # [7]  (avoid div/0)
-        data_norm = (data - self.mean) / self.std  # [N, L, 7]
+        self.mean = data.mean(axis=(0, 1))          # [F]
+        self.std  = data.std(axis=(0, 1)) + 1e-8    # [F]  (avoid div/0)
+        for c in self.mirror_channels:
+            # Statistics of the data plus its mirror image: mean 0, RMS scale.
+            self.mean[c] = 0.0
+            self.std[c]  = float(np.sqrt(np.mean(data[:, :, c] ** 2))) + 1e-8
+        data_norm = (data - self.mean) / self.std   # [N, L, F]
 
         # Transpose to channel-first: [N, 7, L]
         self.data = torch.from_numpy(data_norm.transpose(0, 2, 1))  # [N, 7, L]
@@ -553,6 +571,32 @@ class TrajectoryDataset(Dataset):
             f"shape {tuple(self.data.shape[1:])} | "
             f"from {len(trajectories)} trajectory segment(s)."
         )
+
+    @classmethod
+    def from_config(cls, trajectories: List[np.ndarray], data_cfg: dict, mean_dt_s: float):
+        """Build the dataset with the window and augmentation settings from the
+        ``data:`` config block (used by train, sample and evaluate alike)."""
+        names = list(data_cfg.get("feature_names", DEFAULT_FEATURES))
+        relative = [names.index("alt")] if data_cfg.get("relative_alt", False) and "alt" in names else []
+        mirror = [names.index("roll")] if data_cfg.get("mirror_roll", False) and "roll" in names else []
+        return cls(
+            trajectories,
+            sequence_length=data_cfg["sequence_length"],
+            stride=data_cfg["stride"],
+            mean_dt_s=mean_dt_s,
+            relative_channels=relative,
+            mirror_channels=mirror,
+        )
+
+    def mirror_batch(self, x: torch.Tensor) -> torch.Tensor:
+        """Mirror a random half of a normalised batch [B, F, L] left/right."""
+        if not self.mirror_channels:
+            return x
+        flip = torch.rand(x.shape[0], device=x.device) < 0.5
+        x = x.clone()
+        for c in self.mirror_channels:
+            x[flip, c] = -x[flip, c]
+        return x
 
     def __len__(self) -> int:
         return len(self.data)

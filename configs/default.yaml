@@ -4,24 +4,26 @@
 
 data:
   data_dir: "data/"                # Directory containing raw .bin ArduPilot logs
-  output_dir: "outputs_3feat/"           # Generated trajectory CSVs saved here
-  checkpoint_dir: "checkpoints_3feat/"   # Model weight snapshots saved here
-  sequence_length: 256             # Fixed window length (samples) for each trajectory segment
+  output_dir: "outputs_v4/"           # Generated trajectory CSVs saved here
+  checkpoint_dir: "checkpoints_v4/"   # Model weight snapshots saved here
+  sequence_length: 128             # Window length in samples (12.8 s at 10 Hz; AUTO legs are mostly 15-50 s)
   features: 3                      # [roll, pitch, alt]
   feature_names: [roll, pitch, alt]  # Model channels, picked from data_parser.FULL_COLUMNS
   resample_hz: 10.0                # Uniform grid rate; dt = 1 / resample_hz
-  modes: [AUTO, STABILIZE, MANUAL, RTL, CIRCLE, FBWA, FBWB, CRUISE, LOITER]  # flight modes to keep (AUTO alone gives only ~11 min)
+  modes: [AUTO]                    # ArduPlane flight modes to keep (this project models AUTO flight)
   min_speed_ms: 10.0               # Drop samples slower than this (on the ground / taxiing)
   max_gap_s: 0.3                   # Drop stretches where the log is sparser than this
   gps_timeout_s: 1.0               # Drop samples without a GPS 3D fix in the last N seconds
   max_pos_jump_m: 3.0              # Drop EKF resets (position step vs velocity mismatch)
-  min_mission_samples: 256         # Minimum resampled samples per segment (>= sequence_length)
-  stride: 128                      # Sliding window stride (overlap = sequence_length - stride)
+  min_mission_samples: 128         # Minimum resampled samples per segment (>= sequence_length)
+  stride: 32                       # Sliding window stride (overlap = sequence_length - stride)
+  relative_alt: true               # Altitude as change since the window start
+  mirror_roll: true                # Randomly mirror roll during training (left/right symmetry)
 
 diffusion:
   T: 1000                          # Total forward-process timesteps
   s: 0.008                         # Cosine schedule offset (Nichol & Dhariwal 2021, Appendix B)
-  guidance_scale: 2.0              # w: kinematic guidance strength
+  guidance_scale: 0.0              # w: kinematic guidance strength (0 = off; current guidance adds noise)
   lambda_vel: 0.1                  # weight of velocity-change penalty
   lambda_pitch: 1.0                # Weight for pitch-altitude correlation
   lambda_roll: 0.5                 # Weight for roll smoothness
@@ -36,15 +38,15 @@ training:
   batch_size: 32
   lr: 1.0e-4
   weight_decay: 1.0e-5
-  epochs: 200
-  checkpoint_every: 10             # Save model every N epochs
-  num_workers: 4
+  epochs: 800                      # ~6 batches per epoch with AUTO-only data
+  checkpoint_every: 50             # Save model every N epochs
+  num_workers: 0                   # tiny in-memory dataset; workers only add Windows spawn overhead
   seed: 42
   grad_clip: 1.0                   # Gradient clipping max norm
   lambda_smooth: 0.1               # Weight for predicted x_0 smoothness loss
 
 sampling:
-  num_samples: 8                   # Number of trajectories to generate per run
+  num_samples: 64                  # Number of trajectories to generate per run
   ddim_steps: 50                   # DDIM inference steps (fast; S << T)
   eta: 0.0                         # DDIM stochasticity: 0 = deterministic, 1 = DDPM-equivalent
-  output_csv: "outputs_3feat/generated_trajectories.csv"
+  output_csv: "outputs_v4/generated_trajectories.csv"

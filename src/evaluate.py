@@ -408,12 +408,7 @@ def evaluate(config: dict, generated_csv: str):
     # ── Load real trajectories ────────────────────────────────────────────────
     logger.info("Loading real trajectories for evaluation …")
     trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
-    dataset = TrajectoryDataset(
-        trajectories,
-        sequence_length=config["data"]["sequence_length"],
-        stride=config["data"]["stride"],
-        mean_dt_s=mean_dt_s,
-    )
+    dataset = TrajectoryDataset.from_config(trajectories, config["data"], mean_dt_s)
 
     # Denormalise real data: dataset.data is [N, 3, L] in normalised form
     real_norm = dataset.data                         # [N, 3, L]

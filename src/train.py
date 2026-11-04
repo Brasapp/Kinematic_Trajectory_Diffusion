@@ -97,12 +97,7 @@ def train(config: dict):
     logger.info(f"Loading trajectories from: {config['data']['data_dir']}")
     trajectories, mean_dt_s, mean_speed_ms = parse_directory_from_config(config["data"])
 
-    dataset = TrajectoryDataset(
-        trajectories,
-        sequence_length=config["data"]["sequence_length"],
-        stride=config["data"]["stride"],
-        mean_dt_s=mean_dt_s,
-    )
+    dataset = TrajectoryDataset.from_config(trajectories, config["data"], mean_dt_s)
 
     # 90/10 train/val split
     n_val   = max(1, int(len(dataset) * 0.1))
@@ -183,7 +178,7 @@ def train(config: dict):
         train_loss = 0.0
 
         for batch in train_loader:
-            x0 = batch.to(device)           # [B, 7, L]
+            x0 = dataset.mirror_batch(batch.to(device))   # [B, F, L], random left/right mirror
             B  = x0.shape[0]
 
             # Sample random diffusion timestep t ~ Uniform{0, T-1}
@@ -204,14 +199,18 @@ def train(config: dict):
             # Smoothness constraint on predicted x0 (roll and pitch)
             # x0_pred has shape [B, 3, L] -> index 0: roll, 1: pitch, 2: alt
             x0_pred = scheduler.predict_x0_from_eps(x_t, t, eps_pred)
-            x0_pred = x0_pred.clamp(-5.0, 5.0)  # Prevent explosion at large t
-            
+
             # Compute 2nd derivatives (Laplacian)
             # grad2 = x[i+1] - 2x[i] + x[i-1]
             roll_grad2 = x0_pred[:, 0, 2:] - 2 * x0_pred[:, 0, 1:-1] + x0_pred[:, 0, :-2]
             pitch_grad2 = x0_pred[:, 1, 2:] - 2 * x0_pred[:, 1, 1:-1] + x0_pred[:, 1, :-2]
-            
-            loss_smooth = (roll_grad2 ** 2).mean() + (pitch_grad2 ** 2).mean()
+
+            # Weight each sample by alpha_bar_t: x0_pred is only meaningful at low
+            # noise. Unweighted, the 1/sqrt(alpha_bar_t) factor in x0_pred blows the
+            # gradient up ~1e4x at high t and biases the model there.
+            w_t = scheduler.alpha_bars[t]                                   # [B]
+            smooth_per_sample = (roll_grad2 ** 2).mean(dim=1) + (pitch_grad2 ** 2).mean(dim=1)
+            loss_smooth = (w_t * smooth_per_sample).mean()
             loss = loss_mse + lambda_smooth * loss_smooth
 
             optimizer.zero_grad()

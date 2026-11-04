@@ -9,6 +9,12 @@ checkpoints/
 checkpoints_9feat/
 outputs_3feat/
 checkpoints_3feat/
+outputs_v2/
+checkpoints_v2/
+outputs_v3/
+checkpoints_v3/
+outputs_v4/
+checkpoints_v4/
 
 # Python
 __pycache__/
